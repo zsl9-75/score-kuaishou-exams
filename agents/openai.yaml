@@ -1,0 +1,4 @@
+interface:
+  display_name: "快手考试准确率"
+  short_description: "批量预检、学习本次考核作业范围并增量续跑的快手评分"
+  default_prompt: "使用 $score-kuaishou-exams 批量预检快手Docs；同一考核先学习首份作业范围，再并发读取其余学员并增量评分。"

@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "student_name_headers": ["同学名称", "同学姓名", "学员姓名", "姓名"],
+  "id_headers": ["ID", "id", "Id", "order", "Order", "题目ID", "题号"],
+  "header_aliases": {
+    "整体": ["整体"],
+    "基础画质": ["基础画质"],
+    "画面基础内容": ["画面基础内容"],
+    "画面美学": ["画面美学"],
+    "动态基础质量": ["动态基础质量"],
+    "动态美学": ["动态美学"],
+    "动态美学及视听叙事": ["动态美学及视听叙事", "动态美学及视听叙事性"],
+    "动态幅度": ["动态幅度"],
+    "基础内容指令遵循": ["基础内容指令遵循", "基础内容遵循"],
+    "多镜头指令遵循": ["多镜头指令遵循"],
+    "多镜头间一致连贯性": ["多镜头间一致连贯性", "多镜头一致连贯性"],
+    "输入图一致性": ["输入图一致性"]
+  },
+  "blank_standard_allowed": [
+    "多镜头指令遵循",
+    "多镜头间一致连贯性"
+  ],
+  "profiles": {
+    "screenshot-image-aesthetic": {
+      "display_name": "画面美学",
+      "source_mode": "images",
+      "dimensions": ["画面美学"]
+    },
+    "screenshot-dynamic-aesthetic": {
+      "display_name": "动态美学",
+      "source_mode": "images",
+      "dimensions": ["动态美学"]
+    },
+    "online-aesthetics-dual": {
+      "display_name": "画面美学＋动态美学",
+      "source_mode": "docs",
+      "dimensions": ["画面美学", "动态美学"]
+    },
+    "quiz-text-to-video": {
+      "display_name": "小考文生",
+      "source_mode": "docs",
+      "dimensions": ["基础画质", "画面基础内容", "画面美学", "动态基础质量", "动态美学及视听叙事", "动态幅度"]
+    },
+    "final-text-to-video": {
+      "display_name": "结业文生",
+      "source_mode": "docs",
+      "dimensions": ["整体", "基础画质", "画面基础内容", "画面美学", "动态基础质量", "动态美学及视听叙事", "动态幅度", "基础内容指令遵循", "多镜头指令遵循", "多镜头间一致连贯性"]
+    },
+    "final-image-to-video": {
+      "display_name": "结业图生",
+      "source_mode": "docs",
+      "dimensions": ["整体", "基础画质", "画面基础内容", "画面美学", "动态基础质量", "动态美学及视听叙事", "动态幅度", "基础内容指令遵循", "多镜头指令遵循", "多镜头间一致连贯性", "输入图一致性"]
+    },
+    "retake-text-to-video": {
+      "display_name": "补考文生",
+      "source_mode": "docs",
+      "dimensions": ["整体", "基础画质", "画面基础内容", "画面美学", "动态基础质量", "动态美学及视听叙事", "动态幅度", "基础内容指令遵循", "多镜头指令遵循", "多镜头间一致连贯性"]
+    },
+    "retake-image-to-video": {
+      "display_name": "补考图生",
+      "source_mode": "docs",
+      "dimensions": ["整体", "基础画质", "画面基础内容", "画面美学", "动态基础质量", "动态美学及视听叙事", "动态幅度", "基础内容指令遵循", "多镜头指令遵循", "多镜头间一致连贯性", "输入图一致性"]
+    },
+    "retake-image-aesthetic": {
+      "display_name": "补考画面美学",
+      "source_mode": "docs",
+      "dimensions": ["画面美学"]
+    },
+    "retake-dynamic-aesthetic": {
+      "display_name": "补考动态美学",
+      "source_mode": "docs",
+      "dimensions": ["动态美学"]
+    }
+  }
+}
