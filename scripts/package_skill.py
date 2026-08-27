@@ -20,7 +20,7 @@ REQUIRED = {
     "scripts/ocr_vision.swift",
     "requirements.txt",
 }
-EXCLUDED_PARTS = {".git", "__pycache__", ".score-cache", "output", "incoming", "dist"}
+EXCLUDED_PARTS = {".git", "__pycache__", ".ruff_cache", ".score-cache", "output", "incoming", "dist"}
 
 
 def package(output: Path) -> Path:
