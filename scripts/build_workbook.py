@@ -28,6 +28,17 @@ SCORE_COLORS = [
 ]
 
 
+def safe_excel_value(value: Any) -> Any:
+    """Prevent user-controlled text from becoming an Excel formula."""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def append_safe(ws, values: list[Any]) -> None:
+    ws.append([safe_excel_value(value) for value in values])
+
+
 def style_sheet(ws, widths: list[float], *, percent_columns: list[int] | None = None) -> None:
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A2"
@@ -88,11 +99,12 @@ def build_summary(ws, data: dict[str, Any]) -> None:
                 item.get("source_order", 0),
             )
         )
-        ws.append(["组别", "进度", "同学", "答对数", f"{dimension}准确率", "错误 ID"])
+        append_safe(ws, ["组别", "进度", "同学", "答对数", f"{dimension}准确率", "错误 ID"])
         for summary in summaries:
             dim = summary["dimensions"][dimension]
             wrong = list(dim.get("wrong_ids", [])) + [f"{item}*" for item in dim.get("review_ids", [])]
-            ws.append(
+            append_safe(
+                ws,
                 [
                     data["metadata"]["group"],
                     data["metadata"]["progress"],
@@ -107,9 +119,10 @@ def build_summary(ws, data: dict[str, Any]) -> None:
             add_score_rules(ws, f"E2:E{ws.max_row}")
         return
 
-    ws.append(["组别", "进度", "姓名", *dimensions, f"{len(dimensions)}维度平均准确率"])
+    append_safe(ws, ["组别", "进度", "姓名", *dimensions, f"{len(dimensions)}维度平均准确率"])
     for summary in summaries:
-        ws.append(
+        append_safe(
+            ws,
             [
                 data["metadata"]["group"],
                 data["metadata"]["progress"],
@@ -131,9 +144,10 @@ def build_summary(ws, data: dict[str, Any]) -> None:
 
 
 def build_details(ws, data: dict[str, Any]) -> None:
-    ws.append(["同学", "维度", "ID", "标准答案原文", "作业答案原文", "标准关键词", "命中关键词", "结果", "来源", "OCR置信度", "备注"])
+    append_safe(ws, ["同学", "维度", "ID", "标准答案原文", "作业答案原文", "标准关键词", "命中关键词", "结果", "来源", "OCR置信度", "备注"])
     for item in data.get("details", []):
-        ws.append(
+        append_safe(
+            ws,
             [
                 item.get("student", ""),
                 item.get("dimension", ""),
@@ -155,22 +169,23 @@ def build_details(ws, data: dict[str, Any]) -> None:
 
 
 def build_anomalies(ws, data: dict[str, Any]) -> None:
-    ws.append(["同学", "异常类型", "维度", "ID", "说明"])
+    append_safe(ws, ["同学", "异常类型", "维度", "ID", "说明"])
     rows = data.get("anomalies", [])
     if rows:
         for item in rows:
-            ws.append([item.get("student", ""), item.get("type", ""), item.get("dimension", ""), item.get("id", ""), item.get("detail", "")])
+            append_safe(ws, [item.get("student", ""), item.get("type", ""), item.get("dimension", ""), item.get("id", ""), item.get("detail", "")])
     else:
-        ws.append(["", "无异常", "", "", "本次运行未发现异常"])
+        append_safe(ws, ["", "无异常", "", "", "本次运行未发现异常"])
     for failed in data.get("failed_documents", []):
-        ws.append([failed.get("student", ""), "文档读取失败", "", "", failed.get("error", "")])
+        append_safe(ws, [failed.get("student", ""), "文档读取失败", "", "", failed.get("error", "")])
     style_sheet(ws, [18, 18, 24, 12, 52])
 
 
 def build_evidence(ws, data: dict[str, Any]) -> None:
-    ws.append(["来源", "本地证据路径", "文档链接", "文档ID", "Revision", "工作表/图片", "范围", "读取时间", "内容SHA-256"])
+    append_safe(ws, ["来源", "本地证据路径", "文档链接", "文档ID", "Revision", "工作表/图片", "范围", "读取时间", "内容SHA-256"])
     for item in data.get("evidence", []):
-        ws.append(
+        append_safe(
+            ws,
             [
                 item.get("source", ""),
                 item.get("source_path", ""),

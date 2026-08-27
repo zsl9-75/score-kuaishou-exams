@@ -1,6 +1,6 @@
 # Manifest JSON
 
-Manifest 路径内的相对路径都相对于 Manifest 所在目录解析。建议同一批考试持续复用 `task_id`。
+Manifest 内的证据、别名和缓存相对路径都相对于 Manifest 所在目录解析。正式 `output.dir` 必须是绝对目录，也可以在运行时用绝对 `--output` 覆盖。建议同一批考试持续复用 `task_id`。
 
 ```json
 {
@@ -34,7 +34,7 @@ Manifest 路径内的相对路径都相对于 Manifest 所在目录解析。建�
   },
   "name_aliases": "name-aliases.json",
   "output": {
-    "dir": "output",
+    "dir": "/absolute/path/to/delivery",
     "png": "off",
     "xlsx": "off"
   },
@@ -44,7 +44,9 @@ Manifest 路径内的相对路径都相对于 Manifest 所在目录解析。建�
   "runtime": {
     "max_concurrency": 15,
     "retries": 3,
-    "retry_delays_seconds": [1, 2, 4]
+    "retry_delays_seconds": [1, 2],
+    "ocr_workers": 4,
+    "ocr_confidence_threshold": 0.75
   }
 }
 ```
@@ -62,6 +64,31 @@ Manifest 路径内的相对路径都相对于 Manifest 所在目录解析。建�
 }
 ```
 
+截图考试使用 `screenshot-*` 配置时，Manifest 不执行Docs发现读取，直接读取图片：
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "group-29-screenshot-aesthetic-2026-08",
+  "exam_profile": "screenshot-image-aesthetic",
+  "group": "29组",
+  "progress": "画面美学截图考试",
+  "standard": {"images": "/absolute/input/standard.png"},
+  "homework": {
+    "images": "/absolute/input/homework",
+    "student_roster": "/absolute/input/students.json"
+  },
+  "output": {"dir": "/absolute/delivery", "png": "on", "xlsx": "on"},
+  "runtime": {
+    "ocr_engine": "auto",
+    "ocr_workers": 4,
+    "ocr_confidence_threshold": 0.75
+  }
+}
+```
+
+`standard.images` 与 `homework.images` 可以是单张图片或图片文件夹；也可分别改为已经生成的 `source=image_ocr` 证据路径 `evidence`。图片路径与证据路径必须二选一。
+
 Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sheet`、`range` 或在 `plan --revisions` 快照中提供。`evidence` 只用于已有本地证据 JSON 的预读/测试流程。
 
 `homework.layout_reuse.enabled=true` 时，不要在 `document_defaults.range` 中固定跨考核范围。`discovery_range` 只是首份作业的发现上界；首份证据必须记录实际最小范围。该范围仅保存在当前 `task_id` 的 `.score-cache/runs/`状态中，同一考核后续学员复用；新考核使用新 `task_id` 会重新学习。
@@ -74,7 +101,7 @@ Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sh
 python3 scripts/manifest_runtime.py specs --manifest /path/to/task.json --stage students
 ```
 
-输出的 `items` 已包含稳定 `item_id`、文档ID和URL，批量Docs预检必须原样回传 `item_id`，避免Agent自行重算或逐份建立对应。
+输出的 `items` 已包含稳定 `item_id`、文档ID和URL，批量Docs预检必须原样回传 `item_id`，避免Agent自行重算或逐份建立对应。快照必须完整覆盖本次 `specs` 的全部项，不能出现重复、未知或空 `item_id`；否则整批拒绝，防止部分预检被误当成全量成功。
 
 权限、revision和候选页签应在同一批预检中取得。标准答案和索引可同时提供已确认范围；显式开启 `layout_reuse` 的学员项即使快照带有大范围，运行时也会将它仅作为发现信息，强制用首份实际最小范围建立模板。成功项与失败项使用同一快照：
 
@@ -124,9 +151,12 @@ python3 scripts/manifest_runtime.py ingest-batch \
 字段规则：
 
 - `runtime.max_concurrency` 默认 15，只允许 1–15。
-- `runtime.retries` 默认 3，表示最多3次总尝试（首次＋最多2次重试）；对应退避数组默认为 1、2、4 秒，当前配置最多使用前2个延迟。
+- `runtime.retries` 默认 3，表示最多3次总尝试（首次＋最多2次重试）；对应退避数组默认为 1、2 秒。
 - `runtime.learn_homework_layout` 默认 `true`；可由 `homework.layout_reuse.enabled` 覆盖。
 - `output.png` 是 `on|off`，默认 `off`。
 - `output.xlsx` 是 `auto|on|off`，默认 `off`。
+- `output.dir` 必须是绝对交付目录；推荐每次显式传绝对 `--output`，避免返回Skill目录或临时目录。
 - `cache.dir` 默认 `.score-cache`，必须留在本地运行目录，不进入交付 ZIP。
+- `runtime.ocr_workers` 是API OCR并发数，默认4，只允许1–8；`runtime.ocr_confidence_threshold` 默认0.75。
+- `runtime.ocr_engine` 是 `auto|vision|api`；`auto` 在macOS使用Vision，其他系统使用API。
 - 作业索引变化后，已删除学员标记为 `removed`，新增或链接变化的学员创建新读取项，未变学员继续复用缓存。

@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
+import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,8 @@ def resolve_path(base: Path, value: str | None) -> Path | None:
 
 
 def document_id_from_url(url: str) -> str:
+    if not str(url or "").strip():
+        return ""
     path = urlparse(url).path.rstrip("/")
     candidate = path.rsplit("/", 1)[-1] if path else ""
     return candidate or stable_hash(url)[:16]
@@ -118,7 +121,7 @@ def normalize_document_spec(raw: dict[str, Any], *, role: str, student: str = ""
     merged = {**(defaults or {}), **raw}
     document = merged.get("document") if isinstance(merged.get("document"), dict) else {}
     url = str(merged.get("url") or document.get("url") or "")
-    document_id = str(merged.get("id") or document.get("id") or document_id_from_url(url))
+    document_id = str(merged.get("id") or document.get("id") or (document_id_from_url(url) if url else ""))
     if not url and not document_id:
         raise ManifestError(f"{role} 文档必须提供 url 或 id")
     item_seed = {"role": role, "student": student, "id": document_id, "url": url}
@@ -155,18 +158,20 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ManifestError("retries 必须至少为1")
     runtime["max_concurrency"] = concurrency
     runtime["retries"] = retries
-    runtime.setdefault("retry_delays_seconds", [1, 2, 4])
+    runtime.setdefault("retry_delays_seconds", [1, 2])
     delays = runtime["retry_delays_seconds"]
-    if not isinstance(delays, list) or len(delays) < retries or any(not isinstance(value, (int, float)) or value < 0 for value in delays):
-        raise ManifestError("retry_delays_seconds 必须是长度不小retries的非负数数组")
-    runtime.setdefault("claim_timeout_seconds", 300)
+    if not isinstance(delays, list) or len(delays) < max(0, retries - 1) or any(not isinstance(value, (int, float)) or value < 0 for value in delays):
+        raise ManifestError("retry_delays_seconds 必须是长度不小于 retries-1 的非负数数组")
     runtime.setdefault("learn_homework_layout", True)
+    runtime.setdefault("ocr_engine", "auto")
     runtime.setdefault("ocr_workers", 4)
     runtime.setdefault("ocr_confidence_threshold", 0.75)
     if not 1 <= int(runtime["ocr_workers"]) <= 8:
         raise ManifestError("ocr_workers 必须在 1–8 之间")
     if not 0 <= float(runtime["ocr_confidence_threshold"]) <= 1:
         raise ManifestError("ocr_confidence_threshold 必须在 0–1 之间")
+    if runtime["ocr_engine"] not in {"auto", "vision", "api"}:
+        raise ManifestError("ocr_engine 必须是 auto、vision 或 api")
     output = manifest.setdefault("output", {})
     output.setdefault("dir", "output")
     output.setdefault("png", "off")
@@ -188,11 +193,52 @@ def cache_root(manifest: dict[str, Any]) -> Path:
 
 def state_path(manifest: dict[str, Any]) -> Path:
     safe_task = re.sub(r"[^0-9A-Za-z._-]+", "_", str(manifest["task_id"])).strip("._") or "task"
+    task_digest = stable_hash(str(manifest["task_id"]))[:10]
+    return cache_root(manifest) / "runs" / f"{safe_task[:80]}--{task_digest}.json"
+
+
+def legacy_state_path(manifest: dict[str, Any]) -> Path:
+    safe_task = re.sub(r"[^0-9A-Za-z._-]+", "_", str(manifest["task_id"])).strip("._") or "task"
     return cache_root(manifest) / "runs" / f"{safe_task}.json"
+
+
+@contextmanager
+def state_lock(manifest: dict[str, Any]):
+    """Small cross-platform lock around read/modify/write state transactions."""
+    lock_path = state_path(manifest).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 30
+    descriptor: int | None = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(descriptor, f"{os.getpid()}\n{time.time()}\n".encode("utf-8"))
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 120:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise ManifestError(f"任务状态正被其他进程占用：{lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        finally:
+            lock_path.unlink(missing_ok=True)
 
 
 def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
     path = state_path(manifest)
+    if not path.exists():
+        legacy = legacy_state_path(manifest)
+        if legacy.exists() and legacy != path:
+            path = legacy
     if not path.exists():
         return {
             "schema_version": 2,
@@ -213,6 +259,8 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ManifestError(f"任务状态损坏：{path}：{exc}") from exc
+    if str(state.get("task_id") or "") != str(manifest["task_id"]):
+        raise ManifestError(f"任务状态 task_id 不匹配：{path}")
     state.setdefault("documents", {})
     state.setdefault("resolved_students", [])
     state.setdefault("layouts", {})
@@ -235,12 +283,19 @@ def save_state(manifest: dict[str, Any], state: dict[str, Any]) -> None:
 def evidence_cache_key(spec: dict[str, Any]) -> str | None:
     if not spec.get("revision"):
         return None
-    return stable_hash({key: spec.get(key, "") for key in ("document_id", "revision", "sheet", "range")})
+    return stable_hash({key: spec.get(key, "") for key in ("role", "student", "document_id", "revision", "sheet", "range")})
 
 
 def evidence_cache_path(manifest: dict[str, Any], spec: dict[str, Any]) -> Path | None:
     key = evidence_cache_key(spec)
     return cache_root(manifest) / "evidence" / f"{key}.json" if key else None
+
+
+def legacy_evidence_cache_path(manifest: dict[str, Any], spec: dict[str, Any]) -> Path | None:
+    if not spec.get("revision"):
+        return None
+    key = stable_hash({key: spec.get(key, "") for key in ("document_id", "revision", "sheet", "range")})
+    return cache_root(manifest) / "evidence" / f"{key}.json"
 
 
 def document_specs(manifest: dict[str, Any], state: dict[str, Any], *, stage: str = "all") -> list[dict[str, Any]]:
@@ -400,7 +455,25 @@ def merge_revisions(specs: list[dict[str, Any]], revisions_path: Path | None) ->
     items = payload.get("items", payload) if isinstance(payload, dict) else payload
     if not isinstance(items, list):
         raise ManifestError("revision快照必须是数组或含items数组的对象")
-    by_id = {str(item.get("item_id")): item for item in items if isinstance(item, dict)}
+    if not all(isinstance(item, dict) for item in items):
+        raise ManifestError("revision快照每项必须是对象")
+    item_ids = [str(item.get("item_id") or "") for item in items]
+    if any(not item_id for item_id in item_ids):
+        raise ManifestError("revision快照存在空 item_id")
+    if len(item_ids) != len(set(item_ids)):
+        raise ManifestError("revision快照存在重复 item_id")
+    expected_ids = {str(spec["item_id"]) for spec in specs}
+    observed_ids = set(item_ids)
+    unknown = sorted(observed_ids - expected_ids)
+    missing = sorted(expected_ids - observed_ids)
+    if unknown or missing:
+        parts = []
+        if unknown:
+            parts.append("未知=" + ",".join(unknown))
+        if missing:
+            parts.append("缺失=" + ",".join(missing))
+        raise ManifestError("revision快照必须完整且仅包含本次读取项：" + "；".join(parts))
+    by_id = {str(item["item_id"]): item for item in items}
     merged: list[dict[str, Any]] = []
     for spec in specs:
         update = by_id.get(spec["item_id"], {})
@@ -423,17 +496,33 @@ def find_cached_evidence(manifest: dict[str, Any], spec: dict[str, Any], state: 
     if refresh or not spec.get("revision"):
         return None
     path = evidence_cache_path(manifest, spec)
-    if path and path.exists():
-        return path
+    candidates = [path, legacy_evidence_cache_path(manifest, spec)]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            try:
+                validate_evidence_metadata(spec, load_evidence_payload(candidate))
+            except (OSError, json.JSONDecodeError, ManifestError):
+                continue
+            return candidate
     entry = state.get("documents", {}).get(spec["item_id"], {})
     cached = Path(entry.get("cache_path", "")) if entry.get("cache_path") else None
-    if cached and cached.exists() and all(str(entry.get(key, "")) == str(spec.get(key, "")) for key in ("document_id", "revision", "sheet", "range")):
+    if cached and cached.exists() and all(str(entry.get(key, "")) == str(spec.get(key, "")) for key in ("role", "student", "document_id", "revision", "sheet", "range")):
+        try:
+            validate_evidence_metadata(spec, load_evidence_payload(cached))
+        except (OSError, json.JSONDecodeError, ManifestError):
+            return None
         return cached
     return None
 
 
-def plan_reads(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh: bool = False) -> dict[str, Any]:
+def _plan_reads_unlocked(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh: bool = False) -> dict[str, Any]:
     state = load_state(manifest)
+    homework = manifest.get("homework") if isinstance(manifest.get("homework"), dict) else {}
+    if "documents" in homework and (any(spec.get("role") == "homework" for spec in specs) or not homework.get("documents")):
+        active_ids = {spec["item_id"] for spec in specs if spec.get("role") == "homework"}
+        for stored_id, stored in state.get("documents", {}).items():
+            if stored.get("role") == "homework" and stored_id not in active_ids:
+                stored.update({"status": "removed", "error": "已从显式作业清单移除"})
     specs = prepare_homework_layout_specs(manifest, state, specs)
     cached: list[dict[str, Any]] = []
     reads: list[dict[str, Any]] = []
@@ -450,13 +539,32 @@ def plan_reads(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh
         preflight_error = str(spec.get("preflight_error") or "")
         if preflight_error:
             error_kind = classify_error_kind(preflight_error, str(spec.get("preflight_error_kind") or "") or None)
-            entry.update({"error": preflight_error, "error_kind": error_kind})
-            if error_kind in RETRYABLE_ERROR_KINDS:
-                entry["status"] = "preflight_retry"
-                retry.append({**spec, "error": preflight_error, "error_kind": error_kind})
+            attempts = int(entry.get("attempts", 0)) + 1
+            retryable = error_kind in RETRYABLE_ERROR_KINDS and attempts < int(manifest["runtime"]["retries"])
+            next_attempt_at = ""
+            if retryable:
+                delays = manifest["runtime"]["retry_delays_seconds"]
+                delay = float(delays[min(attempts - 1, len(delays) - 1)])
+                next_attempt_at = utc_text(utc_now() + timedelta(seconds=delay))
+            entry.update({
+                "status": "preflight_retry" if retryable else "failed",
+                "error": preflight_error,
+                "error_kind": error_kind,
+                "attempts": attempts,
+                "next_attempt_at": next_attempt_at,
+                "finished_at": utc_text(),
+            })
+            outcome = {
+                **spec,
+                "error": preflight_error,
+                "error_kind": error_kind,
+                "attempts": attempts,
+                "next_attempt_at": next_attempt_at,
+            }
+            if retryable:
+                retry.append(outcome)
             else:
-                entry["status"] = "failed"
-                failed.append({**spec, "error": preflight_error, "error_kind": error_kind})
+                failed.append(outcome)
             continue
         if entry.get("status") == "failed" and entry.get("error_kind") in FATAL_ERROR_KINDS and not refresh and not spec.get("preflight_ok"):
             failed.append({**spec, "error": entry.get("error", ""), "error_kind": entry.get("error_kind", "other")})
@@ -472,6 +580,18 @@ def plan_reads(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh
         cached_path = find_cached_evidence(manifest, spec, state, refresh=refresh)
         if cached_path:
             entry.update({"status": "cached", "cache_path": str(cached_path), "error": ""})
+            if spec.get("role") == "homework_index":
+                payload = load_evidence_payload(cached_path)
+                resolved_students = resolve_index_students(payload, manifest)
+                state["resolved_students"] = resolved_students
+                defaults = homework.get("document_defaults", {})
+                active_ids = {
+                    normalize_document_spec(item, role="homework", student=str(item["student"]), defaults=defaults)["item_id"]
+                    for item in resolved_students
+                }
+                for stored_id, stored in state.get("documents", {}).items():
+                    if stored.get("role") == "homework" and stored_id not in active_ids:
+                        stored.update({"status": "removed", "error": "已从作业索引移除"})
             cached.append({**spec, "cache_path": str(cached_path)})
         else:
             entry.update({"status": "pending", "error": ""})
@@ -491,11 +611,45 @@ def plan_reads(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh
     }
 
 
+def plan_reads(manifest: dict[str, Any], specs: list[dict[str, Any]], *, refresh: bool = False) -> dict[str, Any]:
+    with state_lock(manifest):
+        return _plan_reads_unlocked(manifest, specs, refresh=refresh)
+
+
 def load_evidence_payload(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ManifestError(f"证据必须是 schema_version=1 的JSON对象：{path}")
+    validate_evidence_payload(payload, path)
     return payload
+
+
+def validate_evidence_payload(payload: dict[str, Any], path: Path | None = None) -> None:
+    label = f"：{path}" if path else ""
+    source = payload.get("source")
+    if source not in {"docs", "image_ocr"}:
+        raise ManifestError(f"证据 source 必须是 docs 或 image_ocr{label}")
+    document = payload.get("document")
+    if not isinstance(document, dict):
+        raise ManifestError(f"证据缺少 document 对象{label}")
+    if not str(document.get("id") or "").strip():
+        raise ManifestError(f"证据 document.id 不能为空{label}")
+    headers = payload.get("headers")
+    rows = payload.get("rows")
+    if not isinstance(headers, list) or not headers:
+        raise ManifestError(f"证据 headers 必须是非空数组{label}")
+    if not isinstance(rows, list):
+        raise ManifestError(f"证据 rows 必须是数组{label}")
+    normalized_headers = [normalize_header(value) for value in headers]
+    if any(not value for value in normalized_headers):
+        raise ManifestError(f"证据表头不能为空{label}")
+    if len(normalized_headers) != len(set(normalized_headers)):
+        raise ManifestError(f"证据表头重复{label}")
+    for row_number, row in enumerate(rows, start=2):
+        if not isinstance(row, list):
+            raise ManifestError(f"证据第{row_number}行必须是数组{label}")
+        if len(row) > len(headers):
+            raise ManifestError(f"证据第{row_number}行列数超过表头{label}")
 
 
 def evidence_metadata(payload: dict[str, Any]) -> dict[str, str]:
@@ -530,6 +684,26 @@ def validate_evidence_metadata(entry: dict[str, Any], payload: dict[str, Any]) -
     evidence_student = str(payload.get("student_name") or "").strip()
     if planned_student and evidence_student and planned_student != evidence_student:
         identity_mismatches.append(f"学员计划={planned_student!r}、证据={evidence_student!r}")
+    if planned_student:
+        config = load_profile_config()
+        headers = list(payload.get("headers") or [])
+        candidate_set = {normalize_header(value) for value in config.get("student_name_headers", [])}
+        name_indexes = [index for index, value in enumerate(headers) if normalize_header(value) in candidate_set]
+        row_identity_found = False
+        if len(name_indexes) > 1:
+            identity_mismatches.append("证据姓名表头重复")
+        elif name_indexes:
+            names = {
+                str(row[name_indexes[0]]).strip()
+                for row in payload.get("rows", [])
+                if isinstance(row, list) and name_indexes[0] < len(row) and str(row[name_indexes[0]] or "").strip()
+            }
+            row_identity_found = bool(names)
+            unexpected = sorted(name for name in names if name != planned_student)
+            if unexpected:
+                identity_mismatches.append(f"学员计划={planned_student!r}、行内姓名={unexpected!r}")
+        if not evidence_student and not row_identity_found:
+            identity_mismatches.append(f"学员计划={planned_student!r}，但证据没有顶层或行内姓名")
     if identity_mismatches:
         raise ManifestError("证据metadata与读取计划不一致：" + "；".join(identity_mismatches + layout_mismatches))
     if layout_mismatches:
@@ -571,7 +745,7 @@ def resolve_index_students(payload: dict[str, Any], manifest: dict[str, Any]) ->
     return students
 
 
-def ingest_evidence(manifest: dict[str, Any], item_id: str, evidence_path: Path) -> dict[str, Any]:
+def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_path: Path) -> dict[str, Any]:
     state = load_state(manifest)
     entry = state.get("documents", {}).get(item_id)
     if entry is None:
@@ -674,6 +848,11 @@ def ingest_evidence(manifest: dict[str, Any], item_id: str, evidence_path: Path)
     }
 
 
+def ingest_evidence(manifest: dict[str, Any], item_id: str, evidence_path: Path) -> dict[str, Any]:
+    with state_lock(manifest):
+        return _ingest_evidence_unlocked(manifest, item_id, evidence_path)
+
+
 def ingest_evidence_batch(manifest: dict[str, Any], evidence_dir: Path) -> dict[str, Any]:
     if not evidence_dir.is_dir():
         raise ManifestError(f"批量证据目录不存在：{evidence_dir}")
@@ -703,9 +882,11 @@ def ingest_evidence_batch(manifest: dict[str, Any], evidence_dir: Path) -> dict[
     }
 
 
-def record_failure(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
+def _record_failure_unlocked(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
     state = load_state(manifest)
-    entry = state.get("documents", {}).setdefault(item_id, {})
+    entry = state.get("documents", {}).get(item_id)
+    if entry is None:
+        raise ManifestError(f"未知读取项：{item_id}；请先执行plan")
     kind = classify_error_kind(error, error_kind)
     attempts = int(entry.get("attempts", 0)) + 1
     if kind == "layout_mismatch":
@@ -739,6 +920,11 @@ def record_failure(manifest: dict[str, Any], item_id: str, error: str, error_kin
     })
     save_state(manifest, state)
     return {"item_id": item_id, "status": entry["status"], "error_kind": kind, "attempts": attempts, "next_attempt_at": next_attempt_at}
+
+
+def record_failure(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
+    with state_lock(manifest):
+        return _record_failure_unlocked(manifest, item_id, error, error_kind)
 
 
 def scoring_documents(manifest: dict[str, Any]) -> tuple[Path | None, list[tuple[str, Path]], list[dict[str, Any]]]:
@@ -806,5 +992,13 @@ def cli() -> int:
     return 0
 
 
+def main() -> int:
+    try:
+        return cli()
+    except (ManifestError, OSError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(cli())
+    raise SystemExit(main())

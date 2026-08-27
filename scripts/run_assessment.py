@@ -10,17 +10,20 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from ocr_api import ApiOcrError, recognize_many as run_api_ocr
 
 from manifest_runtime import (
     INCOMPLETE_DOCUMENT_STATUSES,
     ManifestError,
     atomic_write_json,
     cache_root,
+    canonical_evidence,
     document_specs,
     ingest_evidence,
     load_manifest,
@@ -36,8 +39,7 @@ SKILL_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = SKILL_ROOT / "references" / "exam_profiles.json"
 VISION_SCRIPT = SKILL_ROOT / "scripts" / "ocr_vision.swift"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
-SPECIAL_BLANK_DIMS = {"多镜头指令遵循", "多镜头间一致连贯性"}
-SCORING_RULE_VERSION = "2026-08-23-bidirectional-keyword-v1"
+SCORING_RULE_VERSION = "2026-08-27-evidence-and-ocr-v2"
 STANDARD_ANSWER_DELIMITER = re.compile(r"[\r\n,，、/／|｜]+")
 STANDARD_COLLECTION_KEYS = ("values", "options", "labels", "items", "selected", "selections", "tags")
 STANDARD_SCALAR_KEYS = ("text", "label", "name", "title", "display_value", "displayValue", "value")
@@ -53,6 +55,7 @@ COLORS = {
     "60": "#F5A05C",
     "low": "#F35161",
 }
+MAX_PNG_PIXELS = 80_000_000
 
 
 class AssessmentError(RuntimeError):
@@ -252,7 +255,14 @@ def load_evidence_files(paths: Iterable[Path]) -> list[dict[str, Any]]:
 
 def resolve_header(headers: list[Any], candidates: list[str], label: str, required: bool = True) -> int | None:
     candidate_set = {normalize_header(value) for value in candidates}
-    matches = [index for index, value in enumerate(headers) if normalize_header(value) in candidate_set]
+    normalized = [normalize_header(value) for value in headers]
+    matches = [index for index, value in enumerate(normalized) if value in candidate_set]
+    if not matches:
+        matches = [
+            index
+            for index, value in enumerate(normalized)
+            if value and any(candidate and (candidate in value or value in candidate) for candidate in candidate_set)
+        ]
     if len(matches) > 1:
         raise AssessmentError(f"表头 {label} 出现重复列：{matches}")
     if not matches:
@@ -273,7 +283,7 @@ def dimension_indexes(headers: list[Any], dimensions: list[str], config: dict[st
 def evidence_index(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for doc in documents:
-        public_doc = {key: value for key, value in doc.items() if not key.startswith("_")}
+        public_doc = canonical_evidence({key: value for key, value in doc.items() if not key.startswith("_")})
         digest = sha256_bytes(json.dumps(public_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         metadata = doc.get("document") if isinstance(doc.get("document"), dict) else {}
         entries.append(
@@ -334,7 +344,8 @@ def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], confi
             for dimension, index in dim_indexes.items():
                 raw = row[index]
                 keywords = standard_answer_keywords(raw)
-                if keywords is None and dimension not in SPECIAL_BLANK_DIMS:
+                blank_allowed = set(config.get("blank_standard_allowed") or [])
+                if keywords is None and dimension not in blank_allowed:
                     raise AssessmentError(f"标准答案 ID {row_id} 的“{dimension}”为空；该维度不允许标准空值")
                 standard[dimension][row_id] = {
                     "raw": display_cell_value(raw),
@@ -412,23 +423,41 @@ def parse_homework_documents(
 def run_vision(paths: list[Path]) -> list[dict[str, Any]]:
     swift = shutil.which("swift")
     if not swift or sys.platform != "darwin":
-        raise AssessmentError("当前环境没有可用的 macOS Vision OCR；请让 Agent 用原生 OCR 生成作业证据 JSON")
+        raise AssessmentError("当前环境没有可用的 macOS Vision OCR；请改用 --ocr-engine api")
+    started = time.perf_counter()
     command = [swift, str(VISION_SCRIPT), *[str(path) for path in paths]]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise AssessmentError("Vision OCR 失败：" + (completed.stderr.strip() or "未知错误"))
     try:
-        return json.loads(completed.stdout)
+        results = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise AssessmentError("Vision OCR 返回了无效 JSON") from exc
+    elapsed = round(time.perf_counter() - started, 3)
+    for item in results:
+        item.update({"engine": "vision", "batch_elapsed_seconds": elapsed, "workers": 1})
+    return results
 
 
-def parse_ocr_rows(hits: list[dict[str, Any]], dimension: str) -> tuple[list[list[Any]], dict[str, float]]:
+def ocr_header_matches(value: Any, candidates: list[str]) -> bool:
+    normalized = normalize_header(value)
+    return any(
+        candidate and (candidate == normalized or candidate in normalized or normalized in candidate)
+        for candidate in (normalize_header(item) for item in candidates)
+    )
+
+
+def parse_ocr_rows(hits: list[dict[str, Any]], dimension: str, aliases: list[str] | None = None) -> tuple[list[list[Any]], dict[str, float]]:
     def mid_y(hit: dict[str, Any]) -> float:
         return float(hit["y"]) + float(hit["height"]) / 2
 
-    id_headers = [hit for hit in hits if normalize_header(hit.get("text")) == "ID"]
-    target_headers = [hit for hit in hits if normalize_header(hit.get("text")) == normalize_header(dimension)]
+    def header_hits(candidates: list[str]) -> list[dict[str, Any]]:
+        candidate_set = {normalize_header(value) for value in candidates}
+        exact = [hit for hit in hits if normalize_header(hit.get("text")) in candidate_set]
+        return exact or [hit for hit in hits if ocr_header_matches(hit.get("text"), candidates)]
+
+    id_headers = header_hits(["ID", "order", "题目ID", "题号"])
+    target_headers = header_hits(aliases or [dimension])
     if len(id_headers) != 1 or len(target_headers) != 1:
         raise AssessmentError(f"截图无法唯一定位 ID 和“{dimension}”表头")
     id_header, target = id_headers[0], target_headers[0]
@@ -439,7 +468,12 @@ def parse_ocr_rows(hits: list[dict[str, Any]], dimension: str) -> tuple[list[lis
         if abs(mid_y(hit) - header_y) <= 0.035 and float(hit["x"]) > target_center + 0.03
     ]
     right_boundary = min((target_center + float(hit["x"])) / 2 for hit in top_right) if top_right else min(0.98, target_center + 0.22)
-    left_boundary = max(0.0, float(id_header["x"]) + 0.02)
+    # Keep the actual ID column. Older logic added 0.02 to the ID header's
+    # left edge, which could discard separately recognized ID cells.
+    left_boundary = max(
+        0.0,
+        float(id_header["x"]) - max(0.005, float(id_header.get("width", 0.0)) * 0.25),
+    )
     body = [
         hit for hit in hits
         if mid_y(hit) < header_y - 0.025 and left_boundary <= float(hit["x"]) < right_boundary
@@ -472,41 +506,165 @@ def parse_ocr_rows(hits: list[dict[str, Any]], dimension: str) -> tuple[list[lis
     return rows, confidences
 
 
-def ocr_documents(images_dir: Path, dimension: str, aliases: dict[str, str]) -> list[dict[str, Any]]:
-    paths = sorted(path for path in images_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+GENERIC_IMAGE_NAME_TOKENS = {
+    "截图", "截屏", "屏幕快照", "图片", "照片", "作业", "答案", "考试", "未命名",
+    "image", "img", "screenshot", "微信图片",
+}
+
+
+def image_paths(source: Path) -> list[Path]:
+    if source.is_file():
+        return [source] if source.suffix.lower() in IMAGE_SUFFIXES else []
+    if not source.is_dir():
+        raise AssessmentError(f"图片路径不存在：{source}")
+    return sorted(path for path in source.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+
+
+def load_student_roster(path: Path | None, aliases: dict[str, str]) -> set[str]:
+    names = {normalize_name(value, aliases) for value in aliases.values() if normalize_name(value, aliases)}
+    if path is None:
+        return names
+    if not path.exists():
+        raise AssessmentError(f"学员名单不存在：{path}")
+    if path.suffix.lower() == ".json":
+        payload = load_json(path)
+        if isinstance(payload, dict):
+            values = list(payload.keys()) + list(payload.values())
+        elif isinstance(payload, list):
+            values = payload
+        else:
+            raise AssessmentError("学员名单 JSON 必须是姓名数组或姓名映射对象")
+    else:
+        values = path.read_text(encoding="utf-8").splitlines()
+    names.update(normalize_name(value, aliases) for value in values if normalize_name(value, aliases))
+    return names
+
+
+def filename_student(path: Path, aliases: dict[str, str], roster: set[str]) -> str:
+    raw = re.sub(r"(?:[-_ ]?(?:副本|copy|\(\d+\)|（\d+）))+$", "", path.stem, flags=re.IGNORECASE).strip()
+    candidate = normalize_name(raw, aliases)
+    if roster:
+        return candidate if candidate in roster else ""
+    lowered = candidate.lower()
+    if any(token in lowered for token in GENERIC_IMAGE_NAME_TOKENS):
+        return ""
+    return candidate if re.fullmatch(r"[\u3400-\u9fff·]{2,4}", candidate) else ""
+
+
+def student_name_from_hits(hits: list[dict[str, Any]], aliases: dict[str, str]) -> str:
+    labels = ("同学名称", "同学姓名", "学员姓名", "姓名")
+    for hit in hits:
+        text = str(hit.get("text") or "").strip()
+        match = re.search(r"(?:同学名称|同学姓名|学员姓名|姓名)\s*[:：]?\s*([\u3400-\u9fff·]{2,8})", text)
+        if match:
+            return normalize_name(match.group(1), aliases)
+    for label_hit in hits:
+        if normalize_header(label_hit.get("text")) not in {normalize_header(value) for value in labels}:
+            continue
+        label_y = float(label_hit.get("y", 0)) + float(label_hit.get("height", 0)) / 2
+        label_right = float(label_hit.get("x", 0)) + float(label_hit.get("width", 0))
+        candidates = [
+            hit for hit in hits
+            if float(hit.get("x", 0)) >= label_right
+            and abs((float(hit.get("y", 0)) + float(hit.get("height", 0)) / 2) - label_y) <= 0.035
+            and re.fullmatch(r"[\u3400-\u9fff·]{2,8}", str(hit.get("text") or "").strip())
+        ]
+        if candidates:
+            return normalize_name(min(candidates, key=lambda item: float(item.get("x", 0))).get("text"), aliases)
+    return ""
+
+
+def ocr_documents(
+    images_source: Path,
+    dimensions: list[str],
+    name_aliases: dict[str, str],
+    *,
+    role: str,
+    engine: str = "auto",
+    workers: int = 4,
+    roster: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    paths = image_paths(images_source)
     if not paths:
-        raise AssessmentError(f"图片文件夹没有支持的图片：{images_dir}")
-    results = run_vision(paths)
+        raise AssessmentError(f"图片路径没有支持的图片：{images_source}")
+    selected_engine = engine
+    if selected_engine == "auto":
+        selected_engine = "vision" if sys.platform == "darwin" and shutil.which("swift") else "api"
+    started = time.perf_counter()
+    if selected_engine == "vision":
+        if len(dimensions) != 1:
+            raise AssessmentError("macOS Vision 截图解析目前要求考试配置仅含一个评分维度；多维截图请使用 API OCR")
+        results = run_vision(paths)
+    elif selected_engine == "api":
+        try:
+            results = run_api_ocr(paths, role=role, dimensions=dimensions, workers=workers)
+        except ApiOcrError as exc:
+            raise AssessmentError(str(exc)) from exc
+    else:
+        raise AssessmentError(f"未知 OCR 引擎：{engine}")
     by_path = {str(Path(item["path"]).resolve()): item for item in results}
     documents: list[dict[str, Any]] = []
     seen_names: set[str] = set()
+    roster = roster or set()
+    config = load_config()
     for path in paths:
-        name = normalize_name(path.stem, aliases)
-        if not name:
-            raise AssessmentError(f"图片文件名无法得到学员姓名：{path.name}")
-        if name in seen_names:
-            raise AssessmentError(f"图片文件名映射出重复学员：{name}")
-        seen_names.add(name)
         result = by_path.get(str(path.resolve()))
         if not result:
-            raise AssessmentError(f"Vision OCR 没有返回图片结果：{path.name}")
-        rows, confidence = parse_ocr_rows(result["hits"], dimension)
+            raise AssessmentError(f"OCR 没有返回图片结果：{path.name}")
+        if selected_engine == "vision":
+            dimensions_aliases = config.get("header_aliases", {}).get(dimensions[0], [dimensions[0]])
+            rows, confidence = parse_ocr_rows(result["hits"], dimensions[0], dimensions_aliases)
+            headers = ["ID", dimensions[0]]
+            ocr_name = student_name_from_hits(result["hits"], name_aliases) if role == "homework" else ""
+        else:
+            headers = list(result["headers"])
+            rows = list(result["rows"])
+            confidence = dict(result.get("confidence") or {})
+            # Resolve now so malformed/ambiguous OCR headers fail before scoring.
+            resolve_header(headers, config["id_headers"], "ID", True)
+            dimension_indexes(headers, dimensions, config)
+            ocr_name = normalize_name(result.get("student_name"), name_aliases) if role == "homework" else ""
+        name = ""
+        if role == "homework":
+            file_name = filename_student(path, name_aliases, roster)
+            if file_name and ocr_name and file_name != ocr_name:
+                raise AssessmentError(f"截图姓名冲突：文件名={file_name}，图中姓名={ocr_name}：{path.name}")
+            name = file_name or ocr_name
+            if not name:
+                raise AssessmentError(f"无法从文件名或截图内容确定学员姓名：{path.name}")
+            if roster and name not in roster:
+                raise AssessmentError(f"截图识别到的姓名不在学员名单中：{name}：{path.name}")
+            if name in seen_names:
+                raise AssessmentError(f"截图映射出重复学员：{name}")
+            seen_names.add(name)
         documents.append(
             {
                 "schema_version": 1,
                 "source": "image_ocr",
-                "student_name": name,
+                **({"student_name": name} if role == "homework" else {}),
                 "sheet": path.name,
-                "range": "ID+" + dimension,
+                "range": "ID+" + "+".join(dimensions),
                 "read_at": "",
-                "headers": ["ID", dimension],
+                "headers": headers,
                 "rows": rows,
                 "confidence": confidence,
                 "document": {"url": "", "id": path.name, "revision": sha256_file(path)},
+                "ocr": {
+                    "engine": selected_engine,
+                    "elapsed_seconds": result.get("elapsed_seconds"),
+                    "batch_elapsed_seconds": result.get("batch_elapsed_seconds"),
+                    "workers": result.get("workers", 1),
+                },
                 "_source_path": str(path),
             }
         )
-    return documents
+    return documents, {
+        "engine": selected_engine,
+        "images": len(paths),
+        "workers": workers if selected_engine == "api" else 1,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "per_image_seconds": {path.name: by_path[str(path.resolve())].get("elapsed_seconds") for path in paths},
+    }
 
 
 def score_students(
@@ -514,6 +672,7 @@ def score_students(
     students: OrderedDict[str, StudentRecord],
     dimensions: list[str],
     base_anomalies: list[dict[str, Any]],
+    ocr_confidence_threshold: float = 0.75,
 ) -> dict[str, Any]:
     details: list[dict[str, Any]] = []
     anomalies = list(base_anomalies)
@@ -546,6 +705,12 @@ def score_students(
                 if actual is None:
                     reason = "缺失ID"
                     anomalies.append({"student": student.name, "type": "缺失ID", "dimension": dimension, "id": row_id, "detail": "按未答计错"})
+                elif actual.get("confidence") is not None and float(actual["confidence"]) < ocr_confidence_threshold:
+                    result = "待复核"
+                    reason = f"OCR置信度 {float(actual['confidence']):.3f} 低于阈值 {ocr_confidence_threshold:.3f}"
+                    review_ids.append(row_id)
+                    pending = True
+                    anomalies.append({"student": student.name, "type": "OCR低置信度", "dimension": dimension, "id": row_id, "detail": reason})
                 elif expected_keywords is None:
                     if compact_text(actual_raw) == "":
                         result = "正确"
@@ -618,6 +783,7 @@ def scoring_fingerprint(
     dimensions: list[str],
     profile: dict[str, Any],
     aliases: dict[str, str],
+    ocr_confidence_threshold: float,
 ) -> dict[str, str]:
     standard_payload = {
         dimension: [
@@ -634,6 +800,7 @@ def scoring_fingerprint(
         "standard_hash": stable_hash(standard_payload),
         "profile_hash": stable_hash(profile),
         "aliases_hash": stable_hash(aliases),
+        "ocr_threshold_hash": stable_hash(ocr_confidence_threshold),
         "scoring_rule_version": SCORING_RULE_VERSION,
     }
 
@@ -662,10 +829,11 @@ def score_students_incremental(
     profile: dict[str, Any],
     aliases: dict[str, str],
     score_cache_dir: Path | None,
+    ocr_confidence_threshold: float = 0.75,
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, str]]:
-    fingerprint = scoring_fingerprint(standard, dimensions, profile, aliases)
+    fingerprint = scoring_fingerprint(standard, dimensions, profile, aliases, ocr_confidence_threshold)
     if score_cache_dir is None:
-        scored = score_students(standard, students, dimensions, base_anomalies)
+        scored = score_students(standard, students, dimensions, base_anomalies, ocr_confidence_threshold)
         return scored, {"hits": 0, "misses": len(students)}, fingerprint
 
     score_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -691,6 +859,7 @@ def score_students_incremental(
                 OrderedDict([(student.name, student)]),
                 dimensions,
                 relevant_anomalies,
+                ocr_confidence_threshold,
             )
             atomic_write_json(cache_path, fragment)
             misses += 1
@@ -805,6 +974,8 @@ def render_png(result: dict[str, Any], output_path: Path) -> None:
 
     width = sum(widths) + margin * 2
     height = margin * 2 + title_height + header_height + row_height * len(summaries) + legend_height
+    if width * height > MAX_PNG_PIXELS:
+        raise AssessmentError(f"色阶图尺寸过大（{width}×{height}）；请按组拆分后出图，正式JSON和Excel不受影响")
     image = Image.new("RGB", (width, height), "#F4F6F9")
     draw = ImageDraw.Draw(image)
     title = f"{result['metadata']['group']} · {result['metadata']['progress']} 准确率"
@@ -892,15 +1063,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--group", help="组别，例如 29组")
     parser.add_argument("--progress", help="进度/考试名称")
     parser.add_argument("--standard-evidence", type=Path)
+    parser.add_argument("--standard-images", type=Path, help="截图考试的标准答案图片或图片文件夹")
     parser.add_argument("--homework-evidence", action="append", default=[], type=Path)
     parser.add_argument("--images", type=Path, help="截图单维考试的个人图片文件夹")
     parser.add_argument("--name-aliases", type=Path, help="姓名别名 JSON")
+    parser.add_argument("--student-roster", type=Path, help="截图学员名单（JSON或每行一个姓名的文本）")
+    parser.add_argument("--ocr-engine", choices=["auto", "vision", "api"], default="auto")
+    parser.add_argument("--ocr-workers", type=int, default=4)
+    parser.add_argument("--ocr-confidence-threshold", type=float, default=0.75)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summary-only", action="store_true", help="仅保存评分JSON并输出文字摘要")
     parser.add_argument("--png", choices=["on", "off"], default=None)
     parser.add_argument("--xlsx", choices=["auto", "on", "off"], default=None)
     parser.add_argument("--refresh", action="store_true", help="忽略Manifest证据缓存并重新读取")
-    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-xlsx", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
@@ -928,12 +1103,54 @@ def normalize_output_settings(args: argparse.Namespace, manifest: dict[str, Any]
 
 def output_directory(args: argparse.Namespace, manifest: dict[str, Any] | None = None) -> Path:
     if args.output:
+        if not args.output.is_absolute():
+            raise AssessmentError(f"--output 必须是绝对交付目录：{args.output}")
         return args.output.resolve()
     if manifest:
-        return resolve_path(Path(manifest["_base"]), str(manifest["output"]["dir"])) or Path(manifest["_base"]) / "output"
-    if args.result_json:
-        return args.result_json.resolve().parent
-    raise AssessmentError("必须提供 --output，或在Manifest中配置 output.dir")
+        configured = Path(str(manifest["output"].get("dir") or ""))
+        if configured.is_absolute():
+            return configured
+        raise AssessmentError("交付目录必须明确：请使用 --output /绝对路径，或把 Manifest output.dir 配成绝对路径")
+    raise AssessmentError("必须使用 --output 提供绝对交付目录")
+
+
+def ensure_output_directory(path: Path) -> Path:
+    if not path.is_absolute():
+        raise AssessmentError(f"交付目录必须是绝对路径：{path}")
+    if path.exists() and not path.is_dir():
+        raise AssessmentError(f"交付目录指向了文件而不是文件夹：{path}")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AssessmentError(f"无法创建交付目录 {path}：{exc}") from exc
+    return path
+
+
+def validate_result_schema(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict) or result.get("schema_version") not in {1, 2}:
+        raise AssessmentError("评分JSON必须是 schema_version=1或2 的对象")
+    if result.get("run_status", "complete") not in {"complete", "incomplete"}:
+        raise AssessmentError("评分JSON run_status 必须是 complete 或 incomplete")
+    metadata = result.get("metadata")
+    if not isinstance(metadata, dict):
+        raise AssessmentError("评分JSON缺少 metadata 对象")
+    for key in ("group", "progress", "dimensions"):
+        if key not in metadata:
+            raise AssessmentError(f"评分JSON metadata 缺少 {key}")
+    if not isinstance(metadata["dimensions"], list) or not metadata["dimensions"]:
+        raise AssessmentError("评分JSON metadata.dimensions 必须是非空数组")
+    for key in ("summary", "details", "anomalies", "evidence", "standard_answer_evidence", "failed_documents"):
+        if not isinstance(result.get(key), list):
+            raise AssessmentError(f"评分JSON {key} 必须是数组")
+    if not isinstance(result.get("cache_stats"), dict):
+        raise AssessmentError("评分JSON cache_stats 必须是对象")
+    for index, item in enumerate(result["summary"], start=1):
+        if not isinstance(item, dict) or not str(item.get("student") or "").strip() or not isinstance(item.get("dimensions"), dict):
+            raise AssessmentError(f"评分JSON summary 第{index}项不完整")
+        missing = [dimension for dimension in metadata["dimensions"] if dimension not in item["dimensions"]]
+        if missing:
+            raise AssessmentError(f"评分JSON summary 第{index}项缺少维度：{', '.join(missing)}")
+    return result
 
 
 def emit_optional_outputs(
@@ -953,7 +1170,7 @@ def emit_optional_outputs(
         try:
             png_path = output_dir / f"{stem}_色阶图.png"
             render_png(result, png_path)
-        except AssessmentError as exc:
+        except Exception as exc:
             warnings.append(str(exc))
             hard_output_failure = True
             png_path = None
@@ -967,7 +1184,7 @@ def emit_optional_outputs(
             try:
                 xlsx_path = output_dir / f"{stem}.xlsx"
                 build_workbook(result, xlsx_path)
-            except AssessmentError as exc:
+            except Exception as exc:
                 warnings.append(str(exc))
                 hard_output_failure = xlsx_mode == "on"
                 xlsx_path = None
@@ -985,14 +1202,17 @@ def build_scored_result(
     source_mode: str,
     score_cache_dir: Path | None = None,
     failed_documents: list[dict[str, Any]] | None = None,
+    ocr_confidence_threshold: float = 0.75,
+    ocr_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = load_config()
     profile = config["profiles"].get(profile_key)
     if profile is None:
         raise AssessmentError(f"未知考试配置：{profile_key}；可用值：{', '.join(config['profiles'])}")
     dimensions = list(profile["dimensions"])
-    if any(document.get("source", "") != "docs" for document in standard_documents):
-        raise AssessmentError("标准答案必须来自 Docs 结构化读取证据，不允许使用截图OCR")
+    allowed_source = "image_ocr" if source_mode == "images" else "docs"
+    if any(document.get("source", "") != allowed_source for document in standard_documents):
+        raise AssessmentError(f"考试 {profile['display_name']} 的标准答案必须来自 {allowed_source} 证据")
     if source_mode == "docs":
         if any(document.get("source", "") != "docs" for document in homework_documents):
             raise AssessmentError(f"考试 {profile['display_name']} 的作业必须来自 Docs 结构化读取证据")
@@ -1010,8 +1230,11 @@ def build_scored_result(
         profile,
         aliases,
         score_cache_dir,
+        ocr_confidence_threshold,
     )
     failures = list(failed_documents or [])
+    if not students and not failures:
+        failures.append({"role": "homework", "student": "", "error": "没有发现任何有效学员作业"})
     result = {
         "schema_version": 2,
         "run_status": "incomplete" if failures else "complete",
@@ -1023,6 +1246,8 @@ def build_scored_result(
             "progress": progress,
             "dimensions": dimensions,
             "color_scale": COLORS,
+            "ocr_confidence_threshold": ocr_confidence_threshold,
+            **({"ocr": ocr_stats} if ocr_stats else {}),
             **fingerprint,
         },
         **scored,
@@ -1039,13 +1264,31 @@ def build_scored_result(
 
 def seed_manifest_evidence(manifest: dict[str, Any], refresh: bool) -> None:
     for stage in ("initial", "students"):
-        state = load_state(manifest)
-        specs = document_specs(manifest, state, stage=stage)
-        plan_reads(manifest, specs, refresh=refresh)
-        for spec in specs:
-            evidence = resolve_path(Path(manifest["_base"]), spec.get("evidence"))
-            if evidence and evidence.exists():
-                ingest_evidence(manifest, spec["item_id"], evidence)
+        processed: set[str] = set()
+        for _ in range(1000):
+            state = load_state(manifest)
+            specs = document_specs(manifest, state, stage=stage)
+            plan = plan_reads(manifest, specs, refresh=refresh)
+            readable = {item["item_id"] for item in plan["read"]} - processed
+            ingested = 0
+            for spec in specs:
+                evidence = resolve_path(Path(manifest["_base"]), spec.get("evidence"))
+                local_changed = False
+                if evidence and evidence.exists() and spec["item_id"] not in processed:
+                    try:
+                        local_payload = load_json(evidence)
+                        stored_hash = str(state.get("documents", {}).get(spec["item_id"], {}).get("content_sha256") or "")
+                        local_changed = stable_hash(canonical_evidence(local_payload)) != stored_hash
+                    except AssessmentError:
+                        local_changed = True
+                if evidence and evidence.exists() and (spec["item_id"] in readable or local_changed):
+                    ingest_evidence(manifest, spec["item_id"], evidence)
+                    processed.add(spec["item_id"])
+                    ingested += 1
+            if ingested == 0:
+                break
+        else:
+            raise AssessmentError("Manifest 预置证据处理超过安全上限")
 
 
 def manifest_failures(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1076,18 +1319,84 @@ def load_named_homework(paths: list[tuple[str, Path]]) -> list[dict[str, Any]]:
     return documents
 
 
+def run_image_manifest(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    profile: dict[str, Any],
+) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
+    base = Path(manifest["_base"])
+    aliases = load_aliases(resolve_path(base, manifest.get("name_aliases")))
+    standard_config = manifest.get("standard") if isinstance(manifest.get("standard"), dict) else {}
+    homework_config = manifest.get("homework") if isinstance(manifest.get("homework"), dict) else {}
+    standard_images = resolve_path(base, standard_config.get("images") or standard_config.get("path"))
+    standard_evidence = resolve_path(base, standard_config.get("evidence"))
+    homework_images = resolve_path(base, homework_config.get("images") or homework_config.get("path"))
+    homework_evidence = resolve_path(base, homework_config.get("evidence"))
+    roster_path = resolve_path(base, homework_config.get("student_roster") or manifest.get("student_roster"))
+    if bool(standard_images) == bool(standard_evidence):
+        raise AssessmentError("截图Manifest的 standard 必须且只能配置 images/path 或 evidence")
+    if bool(homework_images) == bool(homework_evidence):
+        raise AssessmentError("截图Manifest的 homework 必须且只能配置 images/path 或 evidence")
+    runtime = manifest["runtime"]
+    ocr_stats: dict[str, Any] = {}
+    if standard_images:
+        standard_documents, ocr_stats["standard"] = ocr_documents(
+            standard_images,
+            list(profile["dimensions"]),
+            aliases,
+            role="standard",
+            engine=str(runtime["ocr_engine"]),
+            workers=int(runtime["ocr_workers"]),
+        )
+    else:
+        standard_documents = load_evidence_files([standard_evidence])
+    if homework_images:
+        homework_documents, ocr_stats["homework"] = ocr_documents(
+            homework_images,
+            list(profile["dimensions"]),
+            aliases,
+            role="homework",
+            engine=str(runtime["ocr_engine"]),
+            workers=int(runtime["ocr_workers"]),
+            roster=load_student_roster(roster_path, aliases),
+        )
+    else:
+        homework_documents = load_evidence_files([homework_evidence])
+    result = build_scored_result(
+        profile_key=manifest["exam_profile"],
+        group=manifest["group"],
+        progress=manifest["progress"],
+        standard_documents=standard_documents,
+        homework_documents=homework_documents,
+        aliases=aliases,
+        source_mode="images",
+        score_cache_dir=cache_root(manifest) / "scores",
+        ocr_confidence_threshold=float(runtime["ocr_confidence_threshold"]),
+        ocr_stats=ocr_stats or None,
+    )
+    output_dir = ensure_output_directory(output_directory(args, manifest))
+    result_path = save_result(result, output_dir)
+    png_mode, xlsx_mode = normalize_output_settings(args, manifest)
+    xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
+    result["output_warnings"] = warnings
+    result["outputs"] = {"json": str(result_path), "png": str(png_path) if png_path else None, "xlsx": str(xlsx_path) if xlsx_path else None}
+    save_result(result, output_dir)
+    return xlsx_path, png_path, result, result_path, hard_failure
+
+
 def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
     manifest = load_manifest(args.manifest.resolve())
+    config = load_config()
+    profile = config["profiles"].get(manifest["exam_profile"])
+    if profile is None:
+        raise AssessmentError(f"未知考试配置：{manifest['exam_profile']}")
+    if profile["source_mode"] == "images":
+        return run_image_manifest(args, manifest, profile)
     seed_manifest_evidence(manifest, args.refresh)
     standard_path, homework_paths, _ = scoring_documents(manifest)
     failures = manifest_failures(manifest)
     if standard_path is None:
-        output_dir = output_directory(args, manifest)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        config = load_config()
-        profile = config["profiles"].get(manifest["exam_profile"])
-        if profile is None:
-            raise AssessmentError(f"未知考试配置：{manifest['exam_profile']}")
+        output_dir = ensure_output_directory(output_directory(args, manifest))
         result = {
             "schema_version": 2,
             "run_status": "incomplete",
@@ -1124,9 +1433,10 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
         standard_documents=standard_documents,
         homework_documents=homework_documents,
         aliases=aliases,
-        source_mode="docs",
+        source_mode=profile["source_mode"],
         score_cache_dir=cache_root(manifest) / "scores",
         failed_documents=failures,
+        ocr_confidence_threshold=float(manifest["runtime"]["ocr_confidence_threshold"]),
     )
     state = load_state(manifest)
     result["cache_stats"]["evidence"] = {
@@ -1134,8 +1444,7 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
         "success": sum(1 for item in state.get("documents", {}).values() if item.get("status") == "success"),
         "pending_or_failed": len(failures),
     }
-    output_dir = output_directory(args, manifest)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_directory(output_directory(args, manifest))
     result_path = save_result(result, output_dir)
     png_mode, xlsx_mode = normalize_output_settings(args, manifest)
     xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
@@ -1146,24 +1455,56 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
 
 
 def run_direct(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
-    required = [name for name in ("exam_profile", "group", "progress", "standard_evidence") if not getattr(args, name)]
+    required = [name for name in ("exam_profile", "group", "progress") if not getattr(args, name)]
     if required:
         raise AssessmentError("直接证据模式缺少参数：" + ", ".join("--" + name.replace("_", "-") for name in required))
     if args.output is None:
         raise AssessmentError("直接证据模式必须提供 --output")
+    if not 1 <= int(args.ocr_workers) <= 8:
+        raise AssessmentError("--ocr-workers 必须在1–8之间")
+    if not 0 <= float(args.ocr_confidence_threshold) <= 1:
+        raise AssessmentError("--ocr-confidence-threshold 必须在0–1之间")
     config = load_config()
     profile = config["profiles"].get(args.exam_profile)
     if profile is None:
         raise AssessmentError(f"未知考试配置：{args.exam_profile}")
     aliases = load_aliases(args.name_aliases)
-    standard_documents = load_evidence_files([args.standard_evidence])
+    if bool(args.standard_evidence) == bool(args.standard_images):
+        raise AssessmentError("必须且只能提供 --standard-evidence 或 --standard-images 之一")
     if args.images and args.homework_evidence:
         raise AssessmentError("--images 与 --homework-evidence 不能同时使用")
+    ocr_stats: dict[str, Any] = {}
     if profile["source_mode"] == "images":
-        if not args.images:
-            raise AssessmentError(f"考试 {profile['display_name']} 需要 --images 图片文件夹")
-        homework_documents = ocr_documents(args.images, profile["dimensions"][0], aliases)
+        roster = load_student_roster(args.student_roster, aliases)
+        if args.standard_images:
+            standard_documents, ocr_stats["standard"] = ocr_documents(
+                args.standard_images,
+                list(profile["dimensions"]),
+                aliases,
+                role="standard",
+                engine=args.ocr_engine,
+                workers=args.ocr_workers,
+            )
+        else:
+            standard_documents = load_evidence_files([args.standard_evidence])
+        if args.images:
+            homework_documents, ocr_stats["homework"] = ocr_documents(
+                args.images,
+                list(profile["dimensions"]),
+                aliases,
+                role="homework",
+                engine=args.ocr_engine,
+                workers=args.ocr_workers,
+                roster=roster,
+            )
+        elif args.homework_evidence:
+            homework_documents = load_evidence_files(args.homework_evidence)
+        else:
+            raise AssessmentError(f"考试 {profile['display_name']} 需要 --images 或 --homework-evidence")
     else:
+        if args.standard_images:
+            raise AssessmentError(f"考试 {profile['display_name']} 的标准答案必须使用 Docs 结构化证据")
+        standard_documents = load_evidence_files([args.standard_evidence])
         if not args.homework_evidence:
             raise AssessmentError(f"考试 {profile['display_name']} 需要至少一个 --homework-evidence")
         homework_documents = load_evidence_files(args.homework_evidence)
@@ -1175,9 +1516,10 @@ def run_direct(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict
         homework_documents=homework_documents,
         aliases=aliases,
         source_mode=profile["source_mode"],
+        ocr_confidence_threshold=float(args.ocr_confidence_threshold),
+        ocr_stats=ocr_stats or None,
     )
-    output_dir = output_directory(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_directory(output_directory(args))
     result_path = save_result(result, output_dir)
     png_mode, xlsx_mode = normalize_output_settings(args)
     xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
@@ -1192,12 +1534,10 @@ def run_from_result(args: argparse.Namespace) -> tuple[Path | None, Path | None,
         result = json.loads(args.result_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AssessmentError(f"无法读取评分JSON：{args.result_json}：{exc}") from exc
-    if result.get("schema_version") not in {1, 2}:
-        raise AssessmentError("评分JSON schema_version 必须为1或2")
     result.setdefault("run_status", "complete")
     result.setdefault("output_warnings", [])
-    output_dir = output_directory(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    validate_result_schema(result)
+    output_dir = ensure_output_directory(output_directory(args))
     png_mode, xlsx_mode = normalize_output_settings(args)
     xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
     result["output_warnings"] = warnings
@@ -1208,15 +1548,22 @@ def run_from_result(args: argparse.Namespace) -> tuple[Path | None, Path | None,
 
 
 def run(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any]]:
-    modes = sum(bool(value) for value in (args.manifest, args.result_json, args.standard_evidence))
+    direct_mode = bool(args.standard_evidence or args.standard_images)
+    modes = sum(bool(value) for value in (args.manifest, args.result_json, direct_mode))
     if modes != 1:
-        raise AssessmentError("必须且只能选择 --manifest、--result-json 或 --standard-evidence 一种入口")
+        raise AssessmentError("必须且只能选择 --manifest、--result-json 或直接输入（--standard-evidence/--standard-images）一种入口")
     if args.manifest:
         xlsx_path, png_path, result, result_path, hard_failure = run_manifest(args)
     elif args.result_json:
         xlsx_path, png_path, result, result_path, hard_failure = run_from_result(args)
     else:
         xlsx_path, png_path, result, result_path, hard_failure = run_direct(args)
+    validate_result_schema(result)
+    if not result_path.exists():
+        raise AssessmentError(f"评分JSON未实际生成：{result_path}")
+    for label, path in (("Excel", xlsx_path), ("PNG", png_path)):
+        if path is not None and not path.exists():
+            raise AssessmentError(f"{label}路径已返回但文件不存在：{path}")
     result["_result_path"] = str(result_path)
     result["_hard_output_failure"] = hard_failure
     return xlsx_path, png_path, result
@@ -1240,7 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         xlsx_path, png_path, result = run(args)
-    except (AssessmentError, ManifestError) as exc:
+    except (AssessmentError, ManifestError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     if args.summary_only:

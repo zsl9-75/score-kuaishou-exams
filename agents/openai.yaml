@@ -1,4 +1,4 @@
 interface:
   display_name: "快手考试准确率"
-  short_description: "批量预检、学习本次考核作业范围并增量续跑的快手评分"
-  default_prompt: "使用 $score-kuaishou-exams 批量预检快手Docs；同一考核先学习首份作业范围，再并发读取其余学员并增量评分。"
+  short_description: "Docs或截图考试的ID/表头匹配、缓存续跑与Excel/色阶图"
+  default_prompt: "使用 $score-kuaishou-exams 批改快手考试：Docs同一考核先学习首份范围再并发读取；截图可用Mac Vision或并发视觉API，标准答案也可为截图。请把正式产物写入明确的绝对交付目录并返回实际文件。"

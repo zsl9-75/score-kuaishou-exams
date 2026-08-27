@@ -4,4 +4,5 @@ __pycache__/
 .score-cache/
 output/
 incoming/
+dist/
 *.tmp

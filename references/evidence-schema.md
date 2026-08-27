@@ -1,6 +1,6 @@
 # 证据 JSON 约定
 
-在线文档必须通过有权限的 Docs 表格读取能力取得原始单元格，再保存为以下结构。不要把网页截图或渲染文字伪装成结构化证据。
+在线文档必须通过有权限的 Docs 表格读取能力取得原始单元格，再保存为以下结构。截图考试由本Skill的OCR分支生成 `source=image_ocr` 的同构证据；不要把网页渲染文字伪装成Docs证据。
 
 ```json
 {
@@ -22,6 +22,8 @@
 ```
 
 标准答案可没有“同学名称”列。作业证据必须包含姓名列；如果一份文档只属于一名学员，也可在顶层提供 `student_name`，但不能同时与姓名列产生冲突。
+
+截图证据的 `document.id` 是图片文件名，`document.revision` 是图片SHA-256；`sheet` 是图片名，`range` 记录识别出的ID与目标维度。标准答案截图不含 `student_name`，作业截图必须在文件名判断或图内姓名OCR后写入 `student_name`。`ocr` 字段记录引擎、并发数和实测耗时；`confidence` 按规范化ID记录0–1置信度。
 
 标准答案单元格可保存一个或多个可接受答案。必须保留 Docs 返回的原始结构，不要在读取证据时预先拼接或覆盖：
 
@@ -76,7 +78,7 @@
 
 ## 缓存键与续跑状态
 
-- revision 存在时，证据缓存键是 `document_id + revision + sheet + range` 的稳定哈希。
+- revision 存在时，证据缓存键是 `role + student + document_id + revision + sheet + range` 的稳定哈希，禁止不同学员共享同一证据缓存项。
 - revision 为空时，不使用 revision 缓存盲目跳过读取；读取后以完整证据内容哈希保存。
 - 学员评分缓存键包含标准答案内容哈希、该学员作业内容哈希、考试配置哈希、评分规则版本和姓名别名哈希。
 - 任务状态以文档为单位记录 `pending/cached/success/failed/removed`、尝试次数、错误和缓存路径。每份证据成功后立即原子保存证据与状态。

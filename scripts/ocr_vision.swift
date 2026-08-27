@@ -16,9 +16,11 @@ struct ImageResult: Codable {
     let width: Int
     let height: Int
     let hits: [Hit]
+    let elapsed_seconds: Double
 }
 
 func recognize(path: String) throws -> ImageResult {
+    let started = Date()
     guard let image = NSImage(contentsOfFile: path),
           let tiff = image.tiffRepresentation,
           let bitmap = NSBitmapImageRep(data: tiff),
@@ -45,7 +47,13 @@ func recognize(path: String) throws -> ImageResult {
         )
     }
 
-    return ImageResult(path: path, width: cgImage.width, height: cgImage.height, hits: hits)
+    return ImageResult(
+        path: path,
+        width: cgImage.width,
+        height: cgImage.height,
+        hits: hits,
+        elapsed_seconds: Date().timeIntervalSince(started)
+    )
 }
 
 do {

@@ -1,6 +1,6 @@
 ---
 name: score-kuaishou-exams
-description: 核对快手考试、补考和小考准确率，按固定维度与ID比较标准答案和学员作业。使用Manifest、批量Docs预检、同一考核首份作业范围学习与复用、15路并发、证据与评分缓存、失败续跑、多关键词双向包含匹配，并可选生成openpyxl Excel与色阶PNG。
+description: 核对快手考试、补考和小考准确率，按固定维度与ID比较标准答案和学员作业。支持Docs结构化证据、截图标准答案与截图作业、Mac Vision或并发视觉API OCR、同一考核范围学习复用、缓存续跑、多关键词双向包含匹配，并生成正式JSON及可选Excel和色阶PNG。
 ---
 
 # 快手考试准确率
@@ -11,7 +11,8 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 
 1. 用户只要从已有正式JSON生成Excel或PNG时，直接执行 `--result-json`；不访问Docs，不重新评分。
 2. 存在原Manifest时复用原 `task_id`，走revision增量路径。只读revision变化、上次失败或未完成的文档。
-3. 只有首次处理本次考核时走完整取数路径。从用户请求确定考试配置、组别和进度，只使用 [exam_profiles.json](references/exam_profiles.json) 声明的维度。
+3. 截图考试使用 `screenshot-*` 配置；一次性运行可直接走 `--standard-images + --images`，需要固定输入与OCR配置时也可使用截图Manifest。
+4. 只有首次处理本次Docs考核时走完整取数路径。从用户请求确定考试配置、组别和进度，只使用 [exam_profiles.json](references/exam_profiles.json) 声明的维度。
 
 ## Manifest主流程
 
@@ -50,7 +51,7 @@ python3 scripts/manifest_runtime.py plan \
 8. 所有必需证据就绪后评分：
 
 ```bash
-python3 scripts/run_assessment.py --manifest /path/to/task.json
+python3 scripts/run_assessment.py --manifest /path/to/task.json --output /absolute/delivery/path
 ```
 
 `--refresh` 忽略证据缓存并重新读取。无 revision 的文档每次重读，再以内容哈希判断是否需要重新评分。缓存和续跑状态保存在 Manifest 旁的 `.score-cache`，不对用户交付，也不放入 Skill ZIP。
@@ -64,7 +65,37 @@ python3 scripts/run_assessment.py --manifest /path/to/task.json
 
 ## 截图考试
 
-截图考试的图片基本文件名必须是学员姓名，每人一张。macOS 优先调用 Vision OCR；非 macOS 先用平台原生批量 OCR 生成相同证据结构。仅并发处理截图作业，标准答案仍必须是 Docs 结构化证据。
+标准答案和学员作业都可以是截图。先把OCR结果转换为与Docs一致的 `headers + rows` 证据，再按ID和表头匹配评分；表头允许与配置别名形成双向包含关系，归因、解释和备注列不参与评分。
+
+学员姓名按以下顺序确定：
+
+1. 如果提供 `--student-roster`，只有文件名规范化后命中名单才视为姓名。
+2. 没有名单时，仅把2–4个汉字且不含“截图/图片/image/screenshot”等通用词的文件名视为姓名。
+3. 文件名不是姓名时，从截图内的“同学名称/同学姓名/学员姓名/姓名”字段识别。
+4. 文件名姓名与图内姓名冲突、姓名不在名单中或多张图映射到同一人时中止，禁止静默猜测。
+
+macOS 的 `--ocr-engine auto` 使用系统 Vision；非 macOS 的 `auto` 使用视觉API，并用 `--ocr-workers` 进行1–8路并发。API密钥只从环境变量读取，不写入Manifest、证据、日志或仓库：
+
+```bash
+export SCORE_OCR_API_KEY="..."
+export SCORE_OCR_API_MODEL="支持图片输入的模型名"
+# 默认是 https://api.openai.com/v1/responses；OpenAI兼容服务可覆盖
+export SCORE_OCR_API_URL="https://api.openai.com/v1/responses"
+
+python3 scripts/run_assessment.py \
+  --exam-profile screenshot-image-aesthetic \
+  --group "29组" \
+  --progress "画面美学" \
+  --standard-images /absolute/input/standard.png \
+  --images /absolute/input/homework \
+  --student-roster /absolute/input/students.json \
+  --ocr-engine auto \
+  --ocr-workers 4 \
+  --output /absolute/delivery \
+  --png on --xlsx on
+```
+
+要比较Mac Vision与API耗时，在同一台Mac、同一批图片上分别执行 `--ocr-engine vision` 和 `--ocr-engine api`。结果JSON的 `metadata.ocr.standard/homework.elapsed_seconds` 与 `per_image_seconds` 是实测值；API耗时受模型、网络、限流、图片大小和并发数影响，不写死固定倍率。低于 `--ocr-confidence-threshold`（默认0.75）的答案进入“待复核”，不静默计对或计错。
 
 ## 输出模式
 
@@ -72,19 +103,21 @@ python3 scripts/run_assessment.py --manifest /path/to/task.json
 
 ```bash
 # 只评分并输出文字摘要，强制不生成PNG/Excel
-python3 scripts/run_assessment.py --manifest /path/to/task.json --summary-only
+python3 scripts/run_assessment.py --manifest /path/to/task.json --output /absolute/delivery --summary-only
 
 # 评分时按需生成
-python3 scripts/run_assessment.py --manifest /path/to/task.json --png on --xlsx auto
+python3 scripts/run_assessment.py --manifest /path/to/task.json --output /absolute/delivery --png on --xlsx auto
 
 # 从现有评分JSON重新生成，不访问Docs、不重新评分
-python3 scripts/run_assessment.py --result-json /path/to/result.json --output /path/to/output --png on --xlsx on
+python3 scripts/run_assessment.py --result-json /path/to/result.json --output /absolute/delivery --png on --xlsx on
 ```
 
 - `--png on|off` 默认 `off`。
 - `--xlsx auto|on|off` 默认 `off`。`auto` 在 openpyxl 不可用时只警告；`on` 输出失败时保留 JSON 和其他成功文件，并以输出失败状态结束。
 - `--skip-xlsx` 暂时等价于 `--xlsx off`。CLI 覆盖 Manifest，Manifest 覆盖默认值。
 - 评分 JSON 始终先保存。任一必需文档失败时，保存 `incomplete` JSON，暂停正式 PNG/Excel，退出码为 4；再次运行同一 Manifest 仅补读失败、未完成或 revision 变化的文档。
+- `--output` 必须是绝对交付目录；Manifest 的 `output.dir` 只有写成绝对路径时才可替代。不要把产物写进Skill安装目录、缓存目录或临时目录。
+- 最终回复只使用CLI最后一行JSON里的 `json/xlsx/png` 绝对路径，并在回复前确认文件存在。不要手写、推测或返回输入证据目录。
 
 ## 不可变评分规则
 
