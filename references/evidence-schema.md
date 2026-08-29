@@ -73,6 +73,7 @@
 - `evidence`：文档 revision、工作表、范围和内容哈希索引；
 - `failed_documents`：失败或等待续跑的文档；
 - `stopped_items`：每个未继续分支的阶段、对象、明确原因和下一步；
+- `user_actions`：按停止阶段归并的最终用户处理清单，`items` 必须完整覆盖 `stopped_items`；
 - `cache_stats`：证据和学员评分片段的命中/未命中数；
 - `metadata.scoring_rule_version`、`standard_hash`、`profile_hash`、`aliases_hash`：增量评分依据。
 
@@ -88,6 +89,19 @@
 个人与全组准确率按全部有效评分格汇总，不再对有效题数不同的维度做等权平均。整维无有效格时状态为“未评分”；全部维度无有效格时结果为 `incomplete`。
 
 结果 JSON 是正式输出和后续渲染的唯一数据源。使用 `--result-json` 生成 PNG/Excel 时不再访问 Docs，不再评分。
+
+## Workflow v2 检查点
+
+Docs 取数不再由 Agent 手工组合中间状态。`manifest_runtime.py workflow` 在 Manifest 旁的 `.score-cache/runs/` 原子保存：
+
+- `task_id`、当前 `stage`、`operation_id` 和 `specs_hash`；
+- 本轮要预检或读取的 `items`；
+- 已应用操作、外部重试次数、自动恢复记录和永久失败项；
+- 已成功证据的缓存路径和内容哈希。
+
+同一 `operation_id` 重复提交必须幂等：不重复增加尝试次数，不重复入库。过期的 `task_id`、`operation_id` 或 `specs_hash` 只返回可恢复契约错误，不改写当前操作。无 revision 证据不使用 revision 缓存，但读取后仍以完整内容哈希审计。
+
+部分文档永久失败时，已成功学员可写入 `run_status=incomplete` 的检查点 JSON，但 `xlsx` 和 `png` 必须为空。只有全部必需证据有效且评分状态完整时，才能发布正式 Excel/PNG。
 
 `source=image_ocr` 时，标准答案和作业的每个有效ID都必须在 `confidence` 中有对应的0–1有限数值。键按题目ID同规则规范化；缺失、布尔值、字符串、NaN、Infinity、越界、重复或无法对齐均不得静默计分，必须进入待复核或在API边界明确停止。
 

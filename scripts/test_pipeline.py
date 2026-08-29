@@ -850,8 +850,436 @@ class PipelineTests(unittest.TestCase):
                 document_id=zhang["document_id"],
                 revision=zhang["revision"],
             ))
+            first = runtime.ingest_evidence(manifest, zhang["item_id"], bad)
+            self.assertEqual(first["status"], "needs_preflight")
+            state = runtime.load_state(manifest)
+            self.assertEqual(state["documents"][zhang["item_id"]]["metadata_refresh_attempts"], 1)
+            state["documents"][zhang["item_id"]].update({
+                "revision": zhang["revision"],
+                "sheet": zhang["sheet"],
+                "range": zhang["range"],
+                "status": "pending",
+            })
+            runtime.save_state(manifest, state)
             with self.assertRaisesRegex(runtime.ManifestError, "行内姓名"):
                 runtime.ingest_evidence(manifest, zhang["item_id"], bad)
+
+    def test_capabilities_and_unknown_command_are_machine_recoverable(self):
+        capabilities = runtime.capabilities_payload()
+        self.assertEqual(capabilities["recommended_command"], "workflow")
+        self.assertIn("workflow", capabilities["commands"])
+        completed = subprocess.run(
+            [sys.executable, str(Path(runtime.__file__)), "validate-layout"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        payload = json.loads(completed.stderr.strip().splitlines()[-1])
+        self.assertTrue(payload["recoverable"])
+        self.assertEqual(payload["error_code"], "cli_contract_error")
+        self.assertIn("workflow", payload["valid_commands"])
+        self.assertTrue(payload["suggested_command"])
+
+    def test_workflow_normalizes_ten_document_revision_mapping(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            homework = [
+                {
+                    "student": f"学员{index}",
+                    "id": f"student-{index}",
+                    "url": f"https://docs.corp.kuaishou.com/student-{index}",
+                }
+                for index in range(10)
+            ]
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload(homework=homework))
+            manifest = runtime.load_manifest(manifest_path)
+            specs = runtime.document_specs(manifest, runtime.load_state(manifest), stage="students")
+            operation = {
+                "task_id": manifest["task_id"],
+                "stage": "students",
+                "type": "preflight_docs",
+                "operation_id": "op-ten",
+                "specs_hash": runtime.workflow_specs_hash(specs),
+            }
+            legacy = {spec["document_id"]: f"revision-{index}" for index, spec in enumerate(specs)}
+            normalized, warnings, recoveries, errors = runtime.normalize_workflow_items(legacy, specs, operation)
+            self.assertEqual(len(normalized), 10)
+            self.assertEqual(errors, [])
+            self.assertTrue(any("文档ID" in item for item in recoveries))
+            self.assertFalse(any("未回传" in item for item in warnings))
+
+    def test_workflow_partial_preflight_keeps_valid_progress_and_retries_missing(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            initial_spec = runtime.document_specs(manifest, state, stage="initial")[0]
+            state["documents"][initial_spec["item_id"]] = {
+                **initial_spec,
+                "status": "success",
+                "preflight_status": "ok",
+            }
+            runtime.save_state(manifest, state)
+            state = runtime.load_state(manifest)
+            specs = runtime.document_specs(manifest, state, stage="students")
+            operation = runtime.create_workflow_operation(
+                manifest, state, action_type="preflight_docs", stage="students", specs=specs,
+            )
+            response = temp / "partial.json"
+            write_json(response, {
+                "schema_version": 2,
+                "task_id": manifest["task_id"],
+                "stage": "students",
+                "operation_id": operation["operation_id"],
+                "specs_hash": operation["specs_hash"],
+                "items": [
+                    {"item_id": specs[0]["item_id"], "revision": "r1", "sheet": "Sheet1", "range": "A1:Z100"},
+                    {"item_id": "unknown", "revision": "r9"},
+                ],
+            })
+            next_step = runtime.workflow_command(manifest, response=response)
+            self.assertEqual(next_step["workflow_status"], "action_required")
+            self.assertEqual(next_step["action"]["type"], "read_docs")
+            self.assertEqual([item["item_id"] for item in next_step["action"]["items"]], [specs[0]["item_id"]])
+            self.assertTrue(any("未知" in item for item in next_step["warnings"]))
+            state = runtime.load_state(manifest)
+            self.assertEqual(state["documents"][specs[0]["item_id"]]["status"], "pending")
+            self.assertEqual(state["documents"][specs[1]["item_id"]]["status"], "preflight_pending")
+
+    def test_workflow_is_idempotent_and_stale_operation_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            first = runtime.workflow_command(manifest)
+            self.assertEqual(first["action"]["type"], "preflight_docs")
+            response = temp / "preflight.json"
+            template = first["action"]["response_template"]
+            for item in template["items"]:
+                item.update({"revision": "r1", "sheet": "Sheet1", "range": "A1:Z100"})
+            write_json(response, template)
+            second = runtime.workflow_command(manifest, response=response)
+            duplicate = runtime.workflow_command(manifest, response=response)
+            self.assertEqual(duplicate["operation_id"], second["operation_id"])
+            self.assertTrue(any("重复提交" in item for item in duplicate["recoveries"]))
+
+            runtime.reset_workflow(manifest)
+            current = runtime.workflow_command(manifest)
+            stale = dict(current["action"]["response_template"])
+            stale["operation_id"] = "stale-operation"
+            write_json(response, stale)
+            recovered = runtime.workflow_command(manifest, response=response)
+            self.assertTrue(recovered["recoverable"])
+            self.assertEqual(recovered["operation_id"], current["operation_id"])
+            self.assertTrue(any("过期" in item for item in recovered["warnings"]))
+
+    def test_workflow_repeated_internal_contract_error_becomes_engineering_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            current = runtime.workflow_command(manifest)
+            response = temp / "stale.json"
+            stale = dict(current["action"]["response_template"])
+            stale["operation_id"] = "stale-operation"
+            write_json(response, stale)
+            first = runtime.workflow_command(manifest, response=response)
+            second = runtime.workflow_command(manifest, response=response)
+            third = runtime.workflow_command(manifest, response=response)
+            self.assertEqual(first["workflow_status"], "action_required")
+            self.assertEqual(second["workflow_status"], "action_required")
+            self.assertEqual(third["workflow_status"], "engineering_blocked")
+            self.assertFalse(third["recoverable"])
+            self.assertTrue(any(item["stage"] == "orchestration" for item in third["blocked_items"]))
+
+    def test_workflow_duplicate_conflict_isolated_while_valid_item_continues(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            initial_spec = runtime.document_specs(manifest, state, stage="initial")[0]
+            state["documents"][initial_spec["item_id"]] = {**initial_spec, "status": "success", "preflight_status": "ok"}
+            runtime.save_state(manifest, state)
+            state = runtime.load_state(manifest)
+            specs = runtime.document_specs(manifest, state, stage="students")
+            operation = runtime.create_workflow_operation(manifest, state, action_type="preflight_docs", stage="students", specs=specs)
+            response = temp / "conflict.json"
+            write_json(response, {
+                "schema_version": 2,
+                "task_id": manifest["task_id"],
+                "operation_id": operation["operation_id"],
+                "specs_hash": operation["specs_hash"],
+                "items": [
+                    {"item_id": specs[0]["item_id"], "revision": "r1", "sheet": "Sheet1", "range": "A1:Z100"},
+                    {"item_id": specs[0]["item_id"], "revision": "r2", "sheet": "Sheet1", "range": "A1:Z100"},
+                    {"item_id": specs[1]["item_id"], "revision": "", "sheet": "Sheet1", "range": "A1:Z100"},
+                ],
+            })
+            next_step = runtime.workflow_command(manifest, response=response)
+            self.assertEqual(next_step["action"]["type"], "read_docs")
+            self.assertEqual([item["item_id"] for item in next_step["action"]["items"]], [specs[1]["item_id"]])
+            self.assertTrue(any("冲突" in item for item in next_step["warnings"]))
+            self.assertTrue(any("没有revision" in item for item in next_step["warnings"]))
+
+    def test_workflow_preflight_retry_uses_three_total_external_attempts(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload(homework=[{
+                "student": "李四", "id": "student-li",
+                "url": "https://docs.corp.kuaishou.com/student-li",
+                "revision": "li-r1", "sheet": "Sheet1", "range": "A1:Z100",
+                "evidence": "li.json",
+            }])
+            payload["runtime"] = {"retries": 3, "retry_delays_seconds": [0, 0]}
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            initial = runtime.document_specs(manifest, state, stage="initial")[0]
+            state["documents"][initial["item_id"]] = {**initial, "status": "success", "preflight_status": "ok"}
+            runtime.save_state(manifest, state)
+
+            response = temp / "timeout.json"
+            current = runtime.workflow_command(manifest)
+            for expected_attempt in (1, 2, 3):
+                template = current["action"]["response_template"]
+                template["items"][0].update({"error_kind": "timeout", "error": "Docs timeout"})
+                write_json(response, template)
+                current = runtime.workflow_command(manifest, response=response)
+                state = runtime.load_state(manifest)
+                student = runtime.document_specs(manifest, state, stage="students")[0]
+                self.assertEqual(state["documents"][student["item_id"]]["attempts"], expected_attempt)
+                if expected_attempt < 3:
+                    self.assertEqual(current["action"]["type"], "preflight_docs")
+
+            self.assertEqual(current["workflow_status"], "ready_to_score")
+            self.assertTrue(any(item.get("student") == "李四" for item in current["blocked_items"]))
+
+    def test_duplicate_read_response_does_not_repeat_failure_count(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            payload["runtime"] = {"retries": 3, "retry_delays_seconds": [30, 60]}
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            initial = runtime.document_specs(manifest, state, stage="initial")[0]
+            state["documents"][initial["item_id"]] = {**initial, "status": "success", "preflight_status": "ok"}
+            specs = runtime.document_specs(manifest, state, stage="students")
+            for spec in specs:
+                state["documents"][spec["item_id"]] = {**spec, "status": "pending"}
+            operation = runtime.create_workflow_operation(
+                manifest, state, action_type="read_docs", stage="students", specs=specs,
+            )
+            incoming = temp / "incoming"
+            incoming.mkdir()
+            zhang = next(item for item in specs if item["student"] == "张三")
+            li = next(item for item in specs if item["student"] == "李四")
+            write_json(
+                incoming / f"{zhang['item_id']}.json",
+                document(
+                    ["ID", "画面美学"], [[1, "都一般"]], student_name="张三",
+                    document_id="student-zhang", revision="zhang-r1",
+                ),
+            )
+            failures = temp / "failures.json"
+            write_json(failures, {
+                "schema_version": 2,
+                "task_id": manifest["task_id"],
+                "operation_id": operation["operation_id"],
+                "specs_hash": operation["specs_hash"],
+                "items": [{"item_id": li["item_id"], "error_kind": "timeout", "error": "Docs timeout"}],
+            })
+
+            runtime.workflow_command(manifest, response=failures, evidence_dir=incoming)
+            first_state = runtime.load_state(manifest)
+            self.assertEqual(first_state["documents"][li["item_id"]]["attempts"], 1)
+            runtime.workflow_command(manifest, response=failures, evidence_dir=incoming)
+            second_state = runtime.load_state(manifest)
+            self.assertEqual(second_state["documents"][li["item_id"]]["attempts"], 1)
+            self.assertIn(operation["operation_id"], second_state["workflow"]["applied_operations"])
+
+    def test_workflow_refresh_repreflights_failed_items_and_preserves_cached_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            initial = runtime.document_specs(manifest, state, stage="initial")[0]
+            cache_path = temp / "standard-cache.json"
+            write_json(cache_path, document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard-doc", revision="std-r1"))
+            state["documents"][initial["item_id"]] = {
+                **initial,
+                "status": "success",
+                "preflight_status": "ok",
+                "cache_path": str(cache_path),
+            }
+            for spec in runtime.document_specs(manifest, state, stage="students"):
+                state["documents"][spec["item_id"]] = {
+                    **spec,
+                    "status": "failed",
+                    "preflight_status": "error",
+                    "error": "无权访问",
+                    "error_kind": "permission",
+                    "attempts": 1,
+                }
+            runtime.save_state(manifest, state)
+
+            refreshed = runtime.workflow_command(manifest, refresh=True)
+            self.assertEqual(refreshed["workflow_status"], "action_required")
+            self.assertEqual(refreshed["action"]["type"], "preflight_docs")
+            self.assertEqual(refreshed["action"]["stage"], "initial")
+            new_state = runtime.load_state(manifest)
+            self.assertTrue(cache_path.exists())
+            self.assertEqual(new_state["documents"][initial["item_id"]]["cache_path"], str(cache_path))
+            self.assertEqual(new_state["documents"][initial["item_id"]]["status"], "preflight_pending")
+            self.assertTrue(all(
+                entry["status"] == "pending"
+                for entry in new_state["documents"].values()
+                if entry.get("role") == "homework"
+            ))
+
+    def test_stale_read_failure_response_keeps_current_operation(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            specs = runtime.document_specs(manifest, state, stage="students")
+            operation = runtime.create_workflow_operation(
+                manifest, state, action_type="read_docs", stage="students", specs=specs,
+            )
+            incoming = temp / "incoming"
+            incoming.mkdir()
+            response = temp / "stale.json"
+            write_json(response, {
+                "task_id": manifest["task_id"],
+                "operation_id": "stale-operation",
+                "items": [{"item_id": specs[0]["item_id"], "error_kind": "timeout", "error": "Docs timeout"}],
+            })
+            recovered = runtime.workflow_command(manifest, response=response, evidence_dir=incoming)
+            self.assertEqual(recovered["workflow_status"], "action_required")
+            self.assertEqual(recovered["operation_id"], operation["operation_id"])
+            self.assertTrue(any("过期" in item for item in recovered["warnings"]))
+            new_state = runtime.load_state(manifest)
+            self.assertEqual(new_state["documents"], {})
+
+    def test_homework_index_collects_all_bad_rows_and_keeps_valid_students(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            payload["homework"] = {
+                "index": {
+                    "id": "index-doc",
+                    "url": "https://docs.corp.kuaishou.com/index-doc",
+                    "name_header": "同学名称",
+                    "link_header": "作业链接",
+                }
+            }
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            index_payload = document(
+                ["同学名称", "作业链接"],
+                [
+                    ["张三", "https://docs.corp.kuaishou.com/zhang"],
+                    ["李四", ""],
+                    ["王五", "https://docs.corp.kuaishou.com/wang-1"],
+                    ["王五", "https://docs.corp.kuaishou.com/wang-2"],
+                    ["赵六", "https://docs.corp.kuaishou.com/zhao"],
+                ],
+                document_id="index-doc",
+            )
+            students, issues = runtime.resolve_index_students_with_issues(index_payload, manifest)
+            self.assertEqual([item["student"] for item in students], ["张三", "赵六"])
+            self.assertEqual(len(issues), 2)
+            self.assertEqual({item["student"] for item in issues}, {"李四", "王五"})
+            self.assertTrue(all(item["error"] and item["next_action"] for item in issues))
+
+    def test_workflow_continues_other_students_and_finishes_with_incomplete_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            payload["output"] = {"dir": str(temp / "delivery"), "png": "on", "xlsx": "on"}
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+
+            preflight_initial = runtime.workflow_command(manifest)
+            self.assertEqual(preflight_initial["action"]["type"], "preflight_docs")
+            initial_response = temp / "initial.json"
+            write_json(initial_response, {"standard-doc": "std-r1"})
+            read_initial = runtime.workflow_command(manifest, response=initial_response)
+            self.assertEqual(read_initial["action"]["type"], "read_docs")
+            incoming_initial = temp / "incoming-initial"
+            incoming_initial.mkdir()
+            standard_item = read_initial["action"]["items"][0]
+            write_json(
+                incoming_initial / f"{standard_item['item_id']}.json",
+                document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard-doc", revision="std-r1"),
+            )
+            preflight_students = runtime.workflow_command(manifest, evidence_dir=incoming_initial)
+            self.assertEqual(preflight_students["action"]["type"], "preflight_docs")
+            student_response = temp / "students.json"
+            write_json(student_response, {
+                "student-zhang": {"revision": "zhang-r1", "sheet": "Sheet1", "range": "A1:Z100"},
+                "student-li": {"revision": "li-r1", "sheet": "Sheet1", "range": "A1:Z100"},
+            })
+            read_students = runtime.workflow_command(manifest, response=student_response)
+            self.assertEqual(read_students["action"]["type"], "read_docs")
+            incoming_students = temp / "incoming-students"
+            incoming_students.mkdir()
+            zhang_item = next(item for item in read_students["action"]["items"] if item["student"] == "张三")
+            li_item = next(item for item in read_students["action"]["items"] if item["student"] == "李四")
+            write_json(
+                incoming_students / f"{zhang_item['item_id']}.json",
+                document(["ID", "画面美学"], [[1, "都一般"]], student_name="张三", document_id="student-zhang", revision="zhang-r1"),
+            )
+            read_failures = temp / "read-failures.json"
+            write_json(read_failures, {
+                "schema_version": 2,
+                "task_id": manifest["task_id"],
+                "operation_id": read_students["operation_id"],
+                "items": [{"item_id": li_item["item_id"], "error_kind": "permission", "error": "无权访问"}],
+            })
+            ready = runtime.workflow_command(manifest, response=read_failures, evidence_dir=incoming_students)
+            self.assertEqual(ready["workflow_status"], "ready_to_score")
+            self.assertEqual(ready["action"]["type"], "score")
+            self.assertTrue(any(item.get("student") == "李四" for item in ready["blocked_items"]))
+
+            args = pipeline.parse_args([
+                "--manifest", str(manifest_path),
+                "--output", str(temp / "delivery"),
+                "--png", "on",
+                "--xlsx", "on",
+            ])
+            xlsx_path, png_path, result, result_path, _ = pipeline.run_manifest(args)
+            self.assertEqual(result["run_status"], "incomplete")
+            self.assertEqual([item["student"] for item in result["summary"]], ["张三"])
+            self.assertIsNone(xlsx_path)
+            self.assertIsNone(png_path)
+            self.assertTrue(result_path.exists())
+            self.assertTrue(result["user_actions"])
+
+            terminal = runtime.workflow_command(
+                manifest,
+                result_json=result_path,
+                operation_id=ready["operation_id"],
+            )
+            self.assertEqual(terminal["workflow_status"], "awaiting_user")
+            self.assertEqual(terminal["run_status"], "incomplete")
+            self.assertTrue(terminal["user_actions"])
 
     def test_concurrent_ingest_preserves_both_students(self):
         with tempfile.TemporaryDirectory() as temp_name:

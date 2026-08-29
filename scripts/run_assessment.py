@@ -1508,6 +1508,28 @@ def stopped_items_for(result: dict[str, Any], warnings: list[str] | None = None)
     return stopped
 
 
+def user_actions_for(stopped_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in stopped_items:
+        if not isinstance(item, dict):
+            continue
+        action_type = str(item.get("stage") or "evidence")
+        grouped.setdefault(action_type, []).append(item)
+    return [
+        {
+            "type": action_type,
+            "prompt": "请处理以下项后复用同一 task_id 续跑",
+            "items": items,
+        }
+        for action_type, items in grouped.items()
+    ]
+
+
+def attach_stop_metadata(result: dict[str, Any], warnings: list[str] | None = None) -> None:
+    result["stopped_items"] = stopped_items_for(result, warnings)
+    result["user_actions"] = user_actions_for(result["stopped_items"])
+
+
 def _finite_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
 
@@ -1723,6 +1745,15 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
     if result.get("stopped_items") is not None:
         if not isinstance(result["stopped_items"], list) or any(not isinstance(item, dict) or not str(item.get("reason") or "").strip() or not str(item.get("next_action") or "").strip() for item in result["stopped_items"]):
             raise AssessmentError("评分JSON stopped_items 必须是含明确reason和next_action的对象数组")
+    if result.get("user_actions") is not None:
+        if not isinstance(result["user_actions"], list) or any(
+            not isinstance(item, dict) or not str(item.get("type") or "").strip() or not str(item.get("prompt") or "").strip() or not isinstance(item.get("items"), list)
+            for item in result["user_actions"]
+        ):
+            raise AssessmentError("评分JSON user_actions 必须是含type、prompt和items的对象数组")
+        action_items = [entry for action in result["user_actions"] for entry in action["items"]]
+        if result.get("stopped_items") is not None and action_items != result["stopped_items"]:
+            raise AssessmentError("评分JSON user_actions必须完整覆盖stopped_items")
     if run_status != "complete" and not result.get("stopped_items"):
         raise AssessmentError(f"评分JSON {run_status} 时必须在 stopped_items 说明停止原因")
     if run_status == "output_failed" and not any(item.get("stage") == "output" for item in result.get("stopped_items", [])):
@@ -1813,7 +1844,7 @@ def deliver_result(
         final_png = final_dir / staged_png.name if staged_png else None
         final_json = final_dir / result_filename(result["metadata"]["group"], result["metadata"]["progress"])
         result["output_warnings"] = warnings
-        result["stopped_items"] = stopped_items_for(result, warnings)
+        attach_stop_metadata(result, warnings)
         result["outputs"] = {
             "json": str(final_json),
             "png": str(final_png) if final_png else None,
@@ -1938,7 +1969,7 @@ def build_scored_result(
             "decision_request": decision_request,
             "preflight_review_items": preflight_review_items,
         }
-        result["stopped_items"] = stopped_items_for(result)
+        attach_stop_metadata(result)
         validate_result_schema(result)
         return result
 
@@ -2002,7 +2033,7 @@ def build_scored_result(
             }
         } if decision_approved else {}),
     }
-    result["stopped_items"] = stopped_items_for(result)
+    attach_stop_metadata(result)
     if len(result["summary"]) != len(students):
         raise AssessmentError("内部校验失败：汇总人数与证据人数不一致")
     validate_result_schema(result)
@@ -2052,6 +2083,18 @@ def manifest_failures(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                     "attempts": entry.get("attempts", 0),
                 }
             )
+    for issue in state.get("index_issues", []):
+        if not isinstance(issue, dict):
+            continue
+        failures.append({
+            "stage": issue.get("stage") or "homework_index",
+            "item_id": "",
+            "role": "homework_index",
+            "student": issue.get("student", ""),
+            "error": issue.get("error") or "作业索引异常",
+            "next_action": issue.get("next_action") or "修订作业索引后复用同一 task_id 续跑",
+            "row_number": issue.get("row_number"),
+        })
     return failures
 
 
@@ -2162,7 +2205,7 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
             "cache_stats": {"scores": {"hits": 0, "misses": 0}},
             "output_warnings": ["标准答案未就绪，已保存续跑状态"],
         }
-        result["stopped_items"] = stopped_items_for(result)
+        attach_stop_metadata(result)
         png_mode, xlsx_mode = normalize_output_settings(args, manifest)
         return deliver_result(result, output_directory(args, manifest), png_mode, xlsx_mode)
 
@@ -2278,6 +2321,7 @@ def run_from_result(args: argparse.Namespace) -> tuple[Path | None, Path | None,
         result["run_status"] = "complete"
         result["output_warnings"] = []
         result["stopped_items"] = []
+        result["user_actions"] = []
     png_mode, xlsx_mode = normalize_output_settings(args)
     return deliver_result(result, output_directory(args), png_mode, xlsx_mode)
 
@@ -2334,13 +2378,15 @@ def main(argv: list[str] | None = None) -> int:
         xlsx_path, png_path, result = run(args)
     except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
+        stopped = [{
+            "stage": "execution",
+            "reason": str(exc),
+            "next_action": "按错误信息修复输入、权限、结构或运行环境后重新执行",
+        }]
         print(json.dumps({
             "status": "stopped",
-            "stopped_items": [{
-                "stage": "execution",
-                "reason": str(exc),
-                "next_action": "按错误信息修复输入、权限、结构或运行环境后重新执行",
-            }],
+            "stopped_items": stopped,
+            "user_actions": user_actions_for(stopped),
         }, ensure_ascii=False), file=sys.stderr)
         return 2
     if args.summary_only:
@@ -2358,6 +2404,7 @@ def main(argv: list[str] | None = None) -> int:
                 "anomalies": len(result["anomalies"]),
                 "warnings": result.get("output_warnings", []),
                 "stopped_items": result.get("stopped_items", []),
+                "user_actions": result.get("user_actions", []),
                 "decision_request": result.get("decision_request"),
             },
             ensure_ascii=False,

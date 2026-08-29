@@ -19,44 +19,54 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 ## Manifest主流程
 
 1. 创建或更新 [Manifest](references/manifest.md)。一次考核始终复用同一 `task_id`；不同考核使用新 `task_id`，禁止跨考核复用作业范围。
-2. 先执行 `specs --stage initial` 取得稳定 `item_id`、文档ID和URL，不修改运行状态。再批量查询标准答案与作业索引的权限、revision、页签和范围，一次性生成预检快照。权限或不存在错误不重试；`429`/timeout/短暂`5xx`才退避重试。`runtime.retries=3` 表示最多3次总尝试（首次＋最多2次重试）。
-3. 执行初始规划：
+2. 每个安装首次运行可执行机器可读能力检查；不要猜测子命令：
 
 ```bash
-python3 scripts/manifest_runtime.py specs --manifest /path/to/task.json --stage initial
-python3 scripts/manifest_runtime.py plan \
+python3 scripts/manifest_runtime.py capabilities --json
+```
+
+3. Docs考核只使用统一入口获取下一步：
+
+```bash
+python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json
+```
+
+4. 严格按 `workflow_status` 和 `action.type` 执行，每次再调用同一 `workflow` 入口：
+
+- `preflight_docs`：批量查询 `action.items` 的权限、revision、页签和范围，优先直接填充 `action.response_template`，再提交：
+
+```bash
+python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json --response /path/to/preflight.json
+```
+
+- `read_docs`：按 `action.items` 并发读取，每份证据命名为 `<item_id>.json`。成功证据写入同一临时目录，失败项写入响应JSON，一次提交：
+
+```bash
+python3 scripts/manifest_runtime.py workflow \
   --manifest /path/to/task.json \
-  --stage initial \
-  --revisions /path/to/initial-revisions.json
+  --evidence-dir /path/to/incoming \
+  --response /path/to/read-failures.json
 ```
 
-4. `cached` 不重读。`read` 并行读取最小范围，证据直接写入本地，Agent上下文只保留状态、计数、哈希和路径，不回显全部单元格。单份可执行 `ingest`，批量证据优先使用 `ingest-batch`：
-
-```bash
-python3 scripts/manifest_runtime.py ingest --manifest /path/to/task.json --item-id ITEM_ID --evidence /path/to/evidence.json
-python3 scripts/manifest_runtime.py ingest-batch --manifest /path/to/task.json --evidence-dir /path/to/incoming
-python3 scripts/manifest_runtime.py fail --manifest /path/to/task.json --item-id ITEM_ID --error "Docs timeout" --error-kind timeout
-```
-
-5. 作业索引 ingest 后，先用 `specs --stage students` 取得全部学员 `item_id`，再批量预检全部学员文档并规划取数：
-
-```bash
-python3 scripts/manifest_runtime.py specs --manifest /path/to/task.json --stage students
-python3 scripts/manifest_runtime.py plan \
-  --manifest /path/to/task.json \
-  --stage students \
-  --revisions /path/to/student-revisions.json
-```
-
-6. 本次考核没有已学习范围时，`plan` 只把第一份作业放入 `read`，其他放入 `deferred`。对首份作业做一次结构发现，将证据保存为实际最小范围并 ingest。状态会在当前 `task_id` 下固化页签、范围、必需表头和有效ID数。
-7. 再次执行 `plan --stage students`。其余学员使用已学习范围，最多15路并发读取。每份都校验必需表头和ID数；证据仅页签/范围与计划不同时也视为布局失配，文档ID、revision或学员身份不同仍是致命metadata错误。快速Docs读取未能产生证据但已确认是布局变化时，执行 `fail --error-kind layout_mismatch`。这些情况均转为 `needs_discovery`，只让该文档回退结构发现。
-8. 所有必需证据就绪后评分：
+- `retrying`：等到 `next_attempt_at` 后重新执行 `workflow`，不询问用户。
+- `ready_to_score`：执行评分后，用返回的 `operation_id` 和评分JSON回传终态：
 
 ```bash
 python3 scripts/run_assessment.py --manifest /path/to/task.json --output /absolute/delivery/path
+python3 scripts/manifest_runtime.py workflow \
+  --manifest /path/to/task.json \
+  --result-json /absolute/delivery/run/result.json \
+  --operation-id SCORE_OPERATION_ID
 ```
 
-`--refresh` 忽略证据缓存并重新读取。无 revision 的文档每次重读，再以内容哈希判断是否需要重新评分。缓存和续跑状态保存在 Manifest 旁的 `.score-cache`，不对用户交付，也不放入 Skill ZIP。
+- `awaiting_user`或 `complete`：才能结束自动循环。`awaiting_user` 必须一次性转述全部 `user_actions`。
+- `engineering_blocked`：仅在相同内部契约错误连续3次后进入，必须保留检查点并报告具体接口、原因和恢复方法。
+
+5. 只要 `recoverable=true`、仍有 `action`或状态为 `retrying`，Agent就必须继续，禁止把工程性错误交给用户处理。未知命令时立即执行 `capabilities --json`并回到 `workflow`。
+
+6. 权限、不存在或身份冲突只隔离对应文档；所有其他可处理文档继续。最终只保存 `incomplete` JSON检查点，禁止生成正式Excel/PNG。
+
+`workflow --refresh` 开始新一轮全量权限/revision预检，但保留已成功证据缓存；同revision文档预检后直接命中缓存，只重读变化或上轮失败的项。无 revision 的文档每次重读，再以内容哈希判断是否需要重新评分。缓存和续跑状态保存在 Manifest 旁的 `.score-cache`，不对用户交付，也不放入 Skill ZIP。底层 `specs/plan/ingest/fail` 仅作兼容和调试，不得再用于默认Agent流程。
 
 ## Docs 读取约束
 
@@ -154,7 +164,7 @@ python3 scripts/run_assessment.py --result-json /path/to/result.json --output /a
 
 ## 输出验收
 
-- JSON schema v4 包含完整汇总、逐题明细、异常、证据索引、失败文档、`group_summary`、`run_id`、`stopped_items`、缓存命中与评分规则版本。排除格记录为“不计分”，维度同时记录原始题数 `source_total`、有效分母 `total` 和 `excluded_ids`；旧schema仍可读取。
+- JSON schema v4 包含完整汇总、逐题明细、异常、证据索引、失败文档、`group_summary`、`run_id`、`stopped_items`、`user_actions`、缓存命中与评分规则版本。排除格记录为“不计分”，维度同时记录原始题数 `source_total`、有效分母 `total` 和 `excluded_ids`；旧schema仍可读取。
 - Excel 使用 openpyxl，包含 `成绩汇总`、`逐题明细`、`异常复核`、`证据索引` 四个工作表；准确率是数值，使用 Excel 原生条件格式。
 - 单维 PNG 按准确率降序显示同学、有效答对数、准确率及错误/排除ID；多维 PNG 按配置顺序显示各维度与有效格汇总总准确率。
 - 色阶固定：90–100% `#6AB37B`，80–89% `#A7D08D`，70–79% `#FEE07B`，60–69% `#F5A05C`，低于60% `#F35161`。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -22,7 +23,10 @@ DEFAULT_RETRIES = 3
 RETRYABLE_ERROR_KINDS = {"429", "timeout", "transient_5xx"}
 FATAL_ERROR_KINDS = {"permission", "not_found", "invalid_evidence", "metadata_mismatch", "other"}
 SPECIAL_ERROR_KINDS = {"layout_mismatch"}
-INCOMPLETE_DOCUMENT_STATUSES = {"pending", "failed", "deferred_layout", "pending_retry", "preflight_retry", "needs_discovery", "in_progress"}
+INCOMPLETE_DOCUMENT_STATUSES = {"pending", "failed", "deferred_layout", "pending_retry", "preflight_pending", "preflight_retry", "needs_discovery", "in_progress"}
+WORKFLOW_VERSION = 2
+WORKFLOW_COMMANDS = ("capabilities", "workflow", "specs", "plan", "ingest", "ingest-batch", "fail", "status")
+INTERNAL_ERROR_LIMIT = 3
 RUNTIME_DIR = Path(__file__).resolve().parent
 if (RUNTIME_DIR.parent / "references" / "exam_profiles.json").is_file():
     PROFILE_CONFIG_PATH = RUNTIME_DIR.parent / "references" / "exam_profiles.json"
@@ -36,17 +40,71 @@ class ManifestError(RuntimeError):
     pass
 
 
+class ManifestCliError(ManifestError):
+    def __init__(self, message: str, *, invalid_command: str = ""):
+        super().__init__(message)
+        self.invalid_command = invalid_command
+
+
 class LayoutMismatch(ManifestError):
     pass
 
 
 class ManifestArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        raise ManifestError(f"命令参数错误：{message}")
+        match = re.search(r"invalid choice: ['\"]([^'\"]+)", message)
+        raise ManifestCliError(f"命令参数错误：{message}", invalid_command=match.group(1) if match else "")
 
 
 def stable_hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def capabilities_payload() -> dict[str, Any]:
+    return {
+        "schema_version": WORKFLOW_VERSION,
+        "workflow_version": WORKFLOW_VERSION,
+        "commands": list(WORKFLOW_COMMANDS),
+        "command_schemas": {
+            "capabilities": {"required": [], "optional": ["--json"]},
+            "workflow": {
+                "required": ["--manifest <path>"],
+                "optional": [
+                    "--response <path>",
+                    "--evidence-dir <path>",
+                    "--result-json <path>",
+                    "--operation-id <id>",
+                    "--refresh",
+                ],
+                "constraints": [
+                    "--evidence-dir and --result-json are mutually exclusive",
+                    "--result-json requires the current score operation_id",
+                ],
+            },
+            "specs": {"compatibility_only": True, "required": ["--manifest <path>"], "optional": ["--stage initial|students|all"]},
+            "plan": {"compatibility_only": True, "required": ["--manifest <path>"], "optional": ["--stage initial|students|all", "--revisions <path>", "--refresh"]},
+            "ingest": {"compatibility_only": True, "required": ["--manifest <path>", "--item-id <id>", "--evidence <path>"]},
+            "ingest-batch": {"compatibility_only": True, "required": ["--manifest <path>", "--evidence-dir <path>"]},
+            "fail": {"compatibility_only": True, "required": ["--manifest <path>", "--item-id <id>", "--error <text>"], "optional": ["--error-kind <kind>"]},
+            "status": {"compatibility_only": True, "required": ["--manifest <path>"]},
+        },
+        "recommended_command": "workflow",
+        "recommended_invocation": "python3 scripts/manifest_runtime.py workflow --manifest /absolute/path/to/task.json",
+        "workflow_statuses": ["action_required", "retrying", "ready_to_score", "awaiting_user", "complete", "engineering_blocked"],
+        "action_types": ["preflight_docs", "read_docs", "score"],
+        "accepted_preflight_shapes": [
+            "workflow-v2 envelope with items",
+            "object with items array",
+            "items array",
+            "item_id to revision mapping",
+            "unique document_id to revision mapping",
+        ],
+        "error_policy": {
+            "contract_errors": "recoverable and do not consume Docs retries",
+            "external_retries": DEFAULT_RETRIES,
+            "formal_outputs_require_complete_evidence": True,
+        },
+    }
 
 
 def utc_now() -> datetime:
@@ -299,6 +357,17 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
                 "next_batch_number": 1,
             },
             "timings": {},
+            "workflow": {
+                "version": WORKFLOW_VERSION,
+                "revision": 0,
+                "current_operation": {},
+                "applied_operations": {},
+                "preflight": {},
+                "contract_errors": {},
+                "recoveries": [],
+                "terminal": {},
+            },
+            "index_issues": [],
         }
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -318,6 +387,16 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
     scheduler.setdefault("batches", {})
     scheduler.setdefault("next_batch_number", 1)
     state.setdefault("timings", {})
+    workflow = state.setdefault("workflow", {})
+    workflow.setdefault("version", WORKFLOW_VERSION)
+    workflow.setdefault("revision", 0)
+    workflow.setdefault("current_operation", {})
+    workflow.setdefault("applied_operations", {})
+    workflow.setdefault("preflight", {})
+    workflow.setdefault("contract_errors", {})
+    workflow.setdefault("recoveries", [])
+    workflow.setdefault("terminal", {})
+    state.setdefault("index_issues", [])
     return state
 
 
@@ -398,6 +477,9 @@ def prepare_homework_layout_specs(
     for original in specs:
         spec = dict(original)
         if spec.get("role") != "homework":
+            prepared.append(spec)
+            continue
+        if spec.get("workflow_preflight_pending"):
             prepared.append(spec)
             continue
         if spec.get("preflight_error"):
@@ -577,6 +659,19 @@ def _plan_reads_unlocked(manifest: dict[str, Any], specs: list[dict[str, Any]], 
     for spec in specs:
         entry = state["documents"].setdefault(spec["item_id"], {})
         entry.update({key: spec.get(key, "") for key in ("role", "student", "url", "document_id", "revision", "sheet", "range", "read_mode")})
+        if spec.get("workflow_preflight_pending"):
+            if entry.get("status") != "preflight_retry":
+                entry.update({"status": "preflight_pending", "error": entry.get("error", "")})
+            deferred.append({**spec, "deferred_reason": "awaiting_preflight"})
+            continue
+        if spec.get("workflow_terminal_failure"):
+            failed.append({
+                **spec,
+                "error": entry.get("error", ""),
+                "error_kind": entry.get("error_kind", "other"),
+                "attempts": int(entry.get("attempts", 0)),
+            })
+            continue
         if spec.get("deferred_layout"):
             entry.update({"status": "deferred_layout", "error": "等待本次考核首份作业固化页签和范围"})
             deferred.append(spec)
@@ -627,8 +722,9 @@ def _plan_reads_unlocked(manifest: dict[str, Any], specs: list[dict[str, Any]], 
             entry.update({"status": "cached", "cache_path": str(cached_path), "error": ""})
             if spec.get("role") == "homework_index":
                 payload = load_evidence_payload(cached_path)
-                resolved_students = resolve_index_students(payload, manifest)
+                resolved_students, index_issues = resolve_index_students_with_issues(payload, manifest)
                 state["resolved_students"] = resolved_students
+                state["index_issues"] = index_issues
                 defaults = homework.get("document_defaults", {})
                 active_ids = {
                     normalize_document_spec(item, role="homework", student=str(item["student"]), defaults=defaults)["item_id"]
@@ -759,7 +855,7 @@ def validate_evidence_metadata(entry: dict[str, Any], payload: dict[str, Any]) -
     return actual
 
 
-def resolve_index_students(payload: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def resolve_index_students_with_issues(payload: dict[str, Any], manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     homework = manifest["homework"]
     index_config = homework.get("index", {}) if isinstance(homework, dict) else {}
     headers = payload.get("headers", [])
@@ -770,11 +866,18 @@ def resolve_index_students(payload: dict[str, Any], manifest: dict[str, Any]) ->
     name_index = next((normalized[re.sub(r"\s+", "", str(value))] for value in name_candidates if value and re.sub(r"\s+", "", str(value)) in normalized), None)
     link_index = next((normalized[re.sub(r"\s+", "", str(value))] for value in link_candidates if value and re.sub(r"\s+", "", str(value)) in normalized), None)
     if name_index is None or link_index is None:
-        raise ManifestError("作业索引缺少姓名列或作业链接列")
+        return [], [{
+            "stage": "homework_index",
+            "row_number": 1,
+            "student": "",
+            "error": "作业索引缺少姓名列或作业链接列",
+            "next_action": "补全姓名列和作业链接列后复用同一 task_id 续跑",
+        }]
     defaults = homework.get("document_defaults", {})
-    students: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
+    students_by_name: dict[str, dict[str, Any]] = {}
+    duplicate_names: set[str] = set()
+    issues: list[dict[str, Any]] = []
+    for row_number, row in enumerate(rows, start=2):
         if not isinstance(row, list):
             continue
         name = str(row[name_index] if name_index < len(row) else "").strip()
@@ -782,11 +885,34 @@ def resolve_index_students(payload: dict[str, Any], manifest: dict[str, Any]) ->
         if not name and not url:
             continue
         if not name or not url:
-            raise ManifestError("作业索引存在姓名或链接为空的行")
-        if name in seen:
-            raise ManifestError(f"作业索引出现重复学员：{name}")
-        seen.add(name)
-        students.append({"student": name, "url": url, "id": document_id_from_url(url), **defaults})
+            issues.append({
+                "stage": "homework_index",
+                "row_number": row_number,
+                "student": name,
+                "error": "作业索引该行的姓名或链接为空",
+                "next_action": f"补全作业索引第{row_number}行后复用同一 task_id 续跑",
+            })
+            continue
+        if name in students_by_name or name in duplicate_names:
+            students_by_name.pop(name, None)
+            if name not in duplicate_names:
+                issues.append({
+                    "stage": "homework_index",
+                    "row_number": row_number,
+                    "student": name,
+                    "error": f"作业索引出现重复学员：{name}",
+                    "next_action": "合并或删除重复学员行后复用同一 task_id 续跑",
+                })
+            duplicate_names.add(name)
+            continue
+        students_by_name[name] = {"student": name, "url": url, "id": document_id_from_url(url), **defaults}
+    return list(students_by_name.values()), issues
+
+
+def resolve_index_students(payload: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    students, issues = resolve_index_students_with_issues(payload, manifest)
+    if issues:
+        raise ManifestError("作业索引存在异常：" + "；".join(str(item["error"]) for item in issues))
     return students
 
 
@@ -812,7 +938,29 @@ def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_p
         save_state(manifest, state)
         return {"item_id": item_id, "status": "needs_discovery", "error_kind": "layout_mismatch", "error": str(exc)}
     except (OSError, json.JSONDecodeError, ManifestError) as exc:
-        entry.update({"status": "failed", "error_kind": "invalid_evidence" if not isinstance(exc, ManifestError) or "metadata" not in str(exc) else "metadata_mismatch", "error": str(exc), "finished_at": utc_text()})
+        metadata_mismatch = isinstance(exc, ManifestError) and "metadata" in str(exc)
+        refresh_attempts = int(entry.get("metadata_refresh_attempts", 0))
+        if metadata_mismatch and refresh_attempts < 1:
+            entry.update({
+                "status": "preflight_pending",
+                "revision": "",
+                "sheet": "",
+                "range": "",
+                "cache_path": "",
+                "preflight_status": "pending",
+                "metadata_refresh_attempts": refresh_attempts + 1,
+                "error_kind": "metadata_mismatch",
+                "error": str(exc),
+                "finished_at": utc_text(),
+            })
+            save_state(manifest, state)
+            return {
+                "item_id": item_id,
+                "status": "needs_preflight",
+                "error_kind": "metadata_mismatch",
+                "error": str(exc),
+            }
+        entry.update({"status": "failed", "error_kind": "metadata_mismatch" if metadata_mismatch else "invalid_evidence", "error": str(exc), "finished_at": utc_text()})
         save_state(manifest, state)
         raise
     learned_layout: dict[str, Any] | None = None
@@ -870,7 +1018,7 @@ def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_p
         "next_attempt_at": "",
     })
     if entry.get("role") == "homework_index":
-        resolved_students = resolve_index_students(payload, manifest)
+        resolved_students, index_issues = resolve_index_students_with_issues(payload, manifest)
         defaults = manifest["homework"].get("document_defaults", {})
         active_item_ids = {
             normalize_document_spec(item, role="homework", student=str(item["student"]), defaults=defaults)["item_id"]
@@ -880,6 +1028,7 @@ def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_p
             if homework_entry.get("role") == "homework" and homework_item_id not in active_item_ids:
                 homework_entry.update({"status": "removed", "error": "已从作业索引移除"})
         state["resolved_students"] = resolved_students
+        state["index_issues"] = index_issues
     if learned_layout is not None:
         state.setdefault("layouts", {})["homework"] = learned_layout
         state.setdefault("scheduler", {}).pop("layout_probe_item_id", None)
@@ -927,8 +1076,13 @@ def ingest_evidence_batch(manifest: dict[str, Any], evidence_dir: Path) -> dict[
     }
 
 
-def _record_failure_unlocked(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
-    state = load_state(manifest)
+def apply_failure_to_state(
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    item_id: str,
+    error: str,
+    error_kind: str | None = None,
+) -> dict[str, Any]:
     entry = state.get("documents", {}).get(item_id)
     if entry is None:
         raise ManifestError(f"未知读取项：{item_id}；请先执行plan")
@@ -947,7 +1101,6 @@ def _record_failure_unlocked(manifest: dict[str, Any], item_id: str, error: str,
             "next_attempt_at": "",
             "finished_at": utc_text(),
         })
-        save_state(manifest, state)
         return {"item_id": item_id, "status": "needs_discovery", "error_kind": kind, "attempts": attempts, "next_attempt_at": ""}
     retryable = kind in RETRYABLE_ERROR_KINDS and attempts < int(manifest["runtime"]["retries"])
     next_attempt_at = ""
@@ -963,8 +1116,14 @@ def _record_failure_unlocked(manifest: dict[str, Any], item_id: str, error: str,
         "next_attempt_at": next_attempt_at,
         "finished_at": utc_text(),
     })
-    save_state(manifest, state)
     return {"item_id": item_id, "status": entry["status"], "error_kind": kind, "attempts": attempts, "next_attempt_at": next_attempt_at}
+
+
+def _record_failure_unlocked(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
+    state = load_state(manifest)
+    result = apply_failure_to_state(manifest, state, item_id, error, error_kind)
+    save_state(manifest, state)
+    return result
 
 
 def record_failure(manifest: dict[str, Any], item_id: str, error: str, error_kind: str | None = None) -> dict[str, Any]:
@@ -992,9 +1151,642 @@ def scoring_documents(manifest: dict[str, Any]) -> tuple[Path | None, list[tuple
     return standard_path, homework_paths, failures
 
 
+def public_workflow_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: spec.get(key, "")
+        for key in ("item_id", "role", "student", "url", "document_id", "revision", "sheet", "range", "read_mode", "discovery_range")
+        if spec.get(key) not in {None, ""}
+    }
+
+
+def workflow_specs_hash(specs: list[dict[str, Any]]) -> str:
+    return stable_hash([
+        {key: spec.get(key, "") for key in ("item_id", "role", "student", "url", "document_id")}
+        for spec in specs
+    ])
+
+
+def workflow_blocked_items(state: dict[str, Any]) -> list[dict[str, Any]]:
+    blocked: list[dict[str, Any]] = []
+    for item_id, entry in state.get("documents", {}).items():
+        if entry.get("status") != "failed":
+            continue
+        blocked.append({
+            "stage": "evidence",
+            "item_id": item_id,
+            "role": entry.get("role", ""),
+            "student": entry.get("student", ""),
+            "reason": entry.get("error") or "证据未就绪",
+            "next_action": "修复权限、链接、身份或证据后复用同一 task_id 续跑",
+        })
+    for issue in state.get("index_issues", []):
+        if not isinstance(issue, dict):
+            continue
+        blocked.append({
+            "stage": issue.get("stage", "homework_index"),
+            "item_id": "",
+            "role": "homework_index",
+            "student": issue.get("student", ""),
+            "row_number": issue.get("row_number"),
+            "reason": issue.get("error") or "作业索引异常",
+            "next_action": issue.get("next_action") or "修订作业索引后复用同一 task_id 续跑",
+        })
+    for signature, item in state.get("workflow", {}).get("contract_errors", {}).items():
+        if int(item.get("attempts", 0)) < INTERNAL_ERROR_LIMIT:
+            continue
+        blocked.append({
+            "stage": "orchestration",
+            "item_id": "",
+            "role": "workflow",
+            "student": "",
+            "reason": item.get("reason") or f"内部契约错误已重复{INTERNAL_ERROR_LIMIT}次",
+            "next_action": item.get("next_action") or "使用 capabilities --json 核对接口后从原检查点续跑",
+            "signature": signature,
+        })
+    return blocked
+
+
+def workflow_user_actions(blocked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in blocked:
+        stage = str(item.get("stage") or "evidence")
+        grouped.setdefault(stage, []).append(item)
+    return [
+        {
+            "type": stage,
+            "prompt": "请处理以下项后复用同一 task_id 续跑",
+            "items": items,
+        }
+        for stage, items in grouped.items()
+    ]
+
+
+def workflow_response_payload(
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    status: str,
+    *,
+    operation: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    recoveries: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    blocked = workflow_blocked_items(state)
+    payload: dict[str, Any] = {
+        "schema_version": WORKFLOW_VERSION,
+        "task_id": manifest["task_id"],
+        "workflow_status": status,
+        "recoverable": status in {"action_required", "retrying", "ready_to_score"},
+        "operation_id": str((operation or {}).get("operation_id") or ""),
+        "action": operation or None,
+        "warnings": list(warnings or []),
+        "recoveries": list(recoveries or []),
+        "blocked_items": blocked,
+        "user_actions": workflow_user_actions(blocked),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def create_workflow_operation(
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    action_type: str,
+    stage: str,
+    specs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    workflow = state["workflow"]
+    workflow["revision"] = int(workflow.get("revision", 0)) + 1
+    specs_digest = workflow_specs_hash(specs)
+    operation_id = stable_hash({
+        "task_id": manifest["task_id"],
+        "action": action_type,
+        "stage": stage,
+        "specs_hash": specs_digest,
+        "revision": workflow["revision"],
+    })[:24]
+    operation: dict[str, Any] = {
+        "type": action_type,
+        "stage": stage,
+        "task_id": manifest["task_id"],
+        "operation_id": operation_id,
+        "specs_hash": specs_digest,
+        "items": [public_workflow_spec(spec) for spec in specs],
+        "created_at": utc_text(),
+    }
+    if action_type == "preflight_docs":
+        operation["response_template"] = {
+            "schema_version": WORKFLOW_VERSION,
+            "task_id": manifest["task_id"],
+            "stage": stage,
+            "operation_id": operation_id,
+            "specs_hash": specs_digest,
+            "items": [
+                {
+                    "item_id": spec["item_id"],
+                    "revision": "",
+                    "sheet": "",
+                    "range": "",
+                }
+                for spec in specs
+            ],
+        }
+    elif action_type == "read_docs":
+        operation["evidence_contract"] = {
+            "directory_file_name": "<item_id>.json",
+            "failure_response": {
+                "schema_version": WORKFLOW_VERSION,
+                "task_id": manifest["task_id"],
+                "stage": stage,
+                "operation_id": operation_id,
+                "items": [{"item_id": "ITEM_ID", "error_kind": "timeout", "error": "Docs timeout"}],
+            },
+        }
+    elif action_type == "score":
+        operation["score_args"] = {
+            "manifest": manifest["_path"],
+            "output": manifest.get("output", {}).get("dir", ""),
+        }
+    workflow["current_operation"] = operation
+    save_state(manifest, state)
+    return operation
+
+
+def normalize_workflow_items(
+    payload: Any,
+    specs: list[dict[str, Any]],
+    operation: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    warnings: list[str] = []
+    recoveries: list[str] = []
+    contract_errors: list[str] = []
+    expected_by_id = {str(spec["item_id"]): spec for spec in specs}
+    by_document: dict[str, list[dict[str, Any]]] = {}
+    for spec in specs:
+        by_document.setdefault(str(spec.get("document_id") or ""), []).append(spec)
+
+    raw_items: Any
+    envelope = payload if isinstance(payload, dict) and "items" in payload else None
+    if envelope is not None:
+        if envelope.get("task_id") not in {None, "", operation.get("task_id"), operation.get("manifest_task_id")} and str(envelope.get("task_id")) != str(operation.get("task_id") or ""):
+            contract_errors.append("workflow快照task_id与当前任务不一致")
+        if envelope.get("operation_id") and str(envelope["operation_id"]) != str(operation["operation_id"]):
+            contract_errors.append("workflow快照operation_id已过期")
+        if envelope.get("specs_hash") and str(envelope["specs_hash"]) != str(operation["specs_hash"]):
+            contract_errors.append("workflow快照specs_hash已过期")
+        raw_items = envelope.get("items")
+    elif isinstance(payload, list):
+        raw_items = payload
+        recoveries.append("已将顶层数组自动规范化为workflow v2 items")
+    elif isinstance(payload, dict):
+        raw_items = []
+        for raw_key, raw_value in payload.items():
+            if raw_key in {"schema_version", "task_id", "stage", "operation_id", "specs_hash"}:
+                continue
+            item = dict(raw_value) if isinstance(raw_value, dict) else {"revision": raw_value}
+            item.setdefault("lookup_key", str(raw_key))
+            raw_items.append(item)
+        recoveries.append("已将映射型revision快照自动规范化为workflow v2 items")
+    else:
+        return [], warnings, recoveries, ["预检响应必须是数组或JSON对象"]
+    if not isinstance(raw_items, list):
+        return [], warnings, recoveries, ["预检响应items必须是数组"]
+
+    normalized_by_id: dict[str, dict[str, Any]] = {}
+    conflicted: set[str] = set()
+    for position, raw in enumerate(raw_items, start=1):
+        if not isinstance(raw, dict):
+            contract_errors.append(f"预检第{position}项不是对象")
+            continue
+        item_id = str(raw.get("item_id") or "")
+        lookup_key = str(raw.get("lookup_key") or raw.get("document_id") or "")
+        if not item_id and lookup_key:
+            if lookup_key in expected_by_id:
+                item_id = lookup_key
+                recoveries.append(f"已将映射键 {lookup_key} 识别为item_id")
+            elif len(by_document.get(lookup_key, [])) == 1:
+                item_id = str(by_document[lookup_key][0]["item_id"])
+                recoveries.append(f"已将文档ID {lookup_key} 自动转换为item_id={item_id}")
+            elif len(by_document.get(lookup_key, [])) > 1:
+                contract_errors.append(f"文档ID {lookup_key} 对应多个读取项，必须回传item_id")
+                continue
+        if item_id not in expected_by_id:
+            warnings.append(f"已忽略未知预检项：{item_id or lookup_key or position}")
+            continue
+        revision = raw.get("revision", "")
+        if isinstance(revision, bool) or isinstance(revision, (dict, list)):
+            contract_errors.append(f"item_id={item_id} 的revision结构无效")
+            continue
+        item = {
+            "item_id": item_id,
+            "revision": "" if revision is None else str(revision),
+            "sheet": "" if raw.get("sheet") is None else str(raw.get("sheet") or ""),
+            "range": "" if raw.get("range") is None else str(raw.get("range") or ""),
+            "error": str(raw.get("error") or ""),
+            "error_kind": str(raw.get("error_kind") or ""),
+        }
+        if not item["revision"] and not item["error"]:
+            warnings.append(f"item_id={item_id} 没有revision，将每次重读并使用内容哈希")
+        previous = normalized_by_id.get(item_id)
+        if previous is not None and stable_hash(previous) != stable_hash(item):
+            conflicted.add(item_id)
+            normalized_by_id.pop(item_id, None)
+            contract_errors.append(f"item_id={item_id} 出现冲突的重复预检结果")
+            continue
+        if previous is not None:
+            recoveries.append(f"已去重一致的预检项：item_id={item_id}")
+        elif item_id not in conflicted:
+            normalized_by_id[item_id] = item
+    missing = sorted(set(expected_by_id) - set(normalized_by_id) - conflicted)
+    if missing:
+        warnings.append("以下项未回传，将在下一轮单独预检：" + ",".join(missing))
+    return list(normalized_by_id.values()), warnings, recoveries, contract_errors
+
+
+def record_workflow_contract_errors(state: dict[str, Any], errors: list[str]) -> bool:
+    blocked = False
+    registry = state["workflow"].setdefault("contract_errors", {})
+    for reason in errors:
+        signature = stable_hash(reason)[:20]
+        item = registry.setdefault(signature, {"attempts": 0, "reason": reason})
+        item["attempts"] = int(item.get("attempts", 0)) + 1
+        item["last_seen_at"] = utc_text()
+        item["next_action"] = "使用 capabilities --json 核对接口，然后使用当前workflow response_template重试"
+        blocked = blocked or item["attempts"] >= INTERNAL_ERROR_LIMIT
+    return blocked
+
+
+def apply_preflight_operation(manifest: dict[str, Any], response_path: Path) -> dict[str, Any]:
+    payload = json.loads(response_path.read_text(encoding="utf-8"))
+    with state_lock(manifest):
+        state = load_state(manifest)
+        operation = state["workflow"].get("current_operation") or {}
+        if operation.get("type") != "preflight_docs":
+            return workflow_response_payload(manifest, state, "action_required", operation=operation, warnings=["当前操作不接受预检响应"])
+        operation_id = str(operation["operation_id"])
+        if operation_id in state["workflow"].get("applied_operations", {}):
+            state["workflow"]["current_operation"] = {}
+            save_state(manifest, state)
+            return {"duplicate": True, "warnings": ["重复的operation_id已忽略"], "recoveries": []}
+        all_specs = document_specs(manifest, state, stage=str(operation["stage"]))
+        requested_ids = {str(item.get("item_id") or "") for item in operation.get("items", []) if isinstance(item, dict)}
+        specs = [spec for spec in all_specs if str(spec["item_id"]) in requested_ids]
+        normalized, warnings, recoveries, contract_errors = normalize_workflow_items(payload, specs, operation)
+        engineering_blocked = False
+        if contract_errors:
+            engineering_blocked = record_workflow_contract_errors(state, contract_errors)
+        fatal_contract_error = any("过期" in reason or "task_id" in reason for reason in contract_errors)
+        if contract_errors and (not normalized or fatal_contract_error):
+            save_state(manifest, state)
+            return {
+                "contract_error": True,
+                "engineering_blocked": engineering_blocked,
+                "warnings": warnings,
+                "recoveries": recoveries,
+                "contract_errors": contract_errors,
+            }
+        warnings.extend(contract_errors)
+        by_id = {item["item_id"]: item for item in normalized}
+        stage_state = state["workflow"].setdefault("preflight", {}).setdefault(str(operation["stage"]), {})
+        for spec in specs:
+            item_id = str(spec["item_id"])
+            update = by_id.get(item_id)
+            if update is None:
+                stage_state[item_id] = {"status": "pending"}
+                continue
+            entry = state["documents"].setdefault(item_id, {})
+            entry.update({key: spec.get(key, "") for key in ("role", "student", "url", "document_id")})
+            entry.update({key: update.get(key, "") for key in ("revision", "sheet", "range")})
+            if update.get("error") or update.get("error_kind"):
+                error = str(update.get("error") or "预检失败")
+                kind = classify_error_kind(error, str(update.get("error_kind") or "") or None)
+                attempts = int(entry.get("attempts", 0)) + 1
+                retryable = kind in RETRYABLE_ERROR_KINDS and attempts < int(manifest["runtime"]["retries"])
+                entry.update({
+                    "status": "preflight_retry" if retryable else "failed",
+                    "preflight_status": "retry" if retryable else "error",
+                    "error": error,
+                    "error_kind": kind,
+                    "attempts": attempts,
+                    "next_attempt_at": utc_text(utc_now() + timedelta(seconds=float(manifest["runtime"]["retry_delays_seconds"][min(attempts - 1, len(manifest["runtime"]["retry_delays_seconds"]) - 1)]))) if retryable else "",
+                })
+                stage_state[item_id] = {"status": entry["preflight_status"], "checked_at": utc_text()}
+            else:
+                entry.update({"status": "preflight_ok", "preflight_status": "ok", "error": "", "error_kind": "", "next_attempt_at": ""})
+                stage_state[item_id] = {"status": "ok", "checked_at": utc_text(), "revision": update.get("revision", "")}
+        state["workflow"].setdefault("applied_operations", {})[operation_id] = {"applied_at": utc_text(), "type": "preflight_docs"}
+        state["workflow"]["current_operation"] = {}
+        state["workflow"].setdefault("recoveries", []).extend(recoveries)
+        save_state(manifest, state)
+        return {"warnings": warnings, "recoveries": recoveries, "contract_errors": [], "engineering_blocked": engineering_blocked}
+
+
+def parse_failure_response(path: Path | None) -> tuple[list[dict[str, str]], dict[str, str]]:
+    if path is None:
+        return [], {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    items = payload.get("items", payload) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise ManifestError("读取失败响应必须是数组或含items数组的对象")
+    failures: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict) or not str(item.get("item_id") or ""):
+            raise ManifestError("读取失败项必须包含item_id")
+        if not item.get("error") and not item.get("error_kind"):
+            continue
+        failures.append({
+            "item_id": str(item["item_id"]),
+            "error": str(item.get("error") or "Docs读取失败"),
+            "error_kind": str(item.get("error_kind") or ""),
+        })
+    envelope = {
+        key: str(payload.get(key) or "")
+        for key in ("task_id", "operation_id", "specs_hash")
+    } if isinstance(payload, dict) else {}
+    return failures, envelope
+
+
+def apply_read_operation(manifest: dict[str, Any], evidence_dir: Path, response_path: Path | None = None) -> dict[str, Any]:
+    state = load_state(manifest)
+    operation = state.get("workflow", {}).get("current_operation") or {}
+    if operation.get("type") != "read_docs":
+        return {"warnings": ["当前操作不接受Docs证据"], "recoveries": []}
+    operation_id = str(operation["operation_id"])
+    if operation_id in state["workflow"].get("applied_operations", {}):
+        return {"duplicate": True, "warnings": ["重复的operation_id已忽略"], "recoveries": []}
+    failures, envelope = parse_failure_response(response_path)
+    contract_errors: list[str] = []
+    if envelope.get("task_id") and envelope["task_id"] != str(manifest["task_id"]):
+        contract_errors.append("读取失败响应task_id与当前任务不一致")
+    if envelope.get("operation_id") and envelope["operation_id"] != operation_id:
+        contract_errors.append("读取失败响应operation_id已过期")
+    if envelope.get("specs_hash") and envelope["specs_hash"] != str(operation.get("specs_hash") or ""):
+        contract_errors.append("读取失败响应specs_hash已过期")
+    if contract_errors:
+        with state_lock(manifest):
+            state = load_state(manifest)
+            engineering_blocked = record_workflow_contract_errors(state, contract_errors)
+            save_state(manifest, state)
+        return {
+            "contract_error": True,
+            "engineering_blocked": engineering_blocked,
+            "contract_errors": contract_errors,
+            "warnings": [],
+            "recoveries": [],
+        }
+    batch = ingest_evidence_batch(manifest, evidence_dir)
+    expected_ids = {
+        str(item.get("item_id") or "")
+        for item in operation.get("items", [])
+        if isinstance(item, dict)
+    }
+    ignored_failures: list[str] = []
+    with state_lock(manifest):
+        state = load_state(manifest)
+        if operation_id in state["workflow"].get("applied_operations", {}):
+            return {"duplicate": True, "warnings": ["重复的operation_id已忽略"], "recoveries": []}
+        current = state["workflow"].get("current_operation") or {}
+        if str(current.get("operation_id") or "") != operation_id:
+            return {"warnings": ["读取响应已过期，已保留当前检查点"], "recoveries": []}
+        failure_results: list[dict[str, Any]] = []
+        for failure in failures:
+            if failure["item_id"] not in expected_ids:
+                ignored_failures.append(failure["item_id"])
+                continue
+            failure_results.append(apply_failure_to_state(
+                manifest,
+                state,
+                failure["item_id"],
+                failure["error"],
+                failure["error_kind"] or None,
+            ))
+        state["workflow"].setdefault("applied_operations", {})[operation_id] = {"applied_at": utc_text(), "type": "read_docs"}
+        state["workflow"]["current_operation"] = {}
+        save_state(manifest, state)
+    warnings = [f"{len(batch.get('missing_files', []))}份证据文件未回传"] if batch.get("missing_files") else []
+    if ignored_failures:
+        warnings.append("已忽略不属于当前操作的失败项：" + ",".join(sorted(ignored_failures)))
+    return {
+        "warnings": warnings,
+        "recoveries": [f"已入库{batch.get('ingested', 0)}份，布局回退{batch.get('needs_discovery', 0)}份，读取失败{len(failure_results)}份"],
+        "batch": batch,
+    }
+
+
+def finalize_workflow_result(manifest: dict[str, Any], result_path: Path, operation_id: str) -> dict[str, Any]:
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    with state_lock(manifest):
+        state = load_state(manifest)
+        operation = state["workflow"].get("current_operation") or {}
+        if operation.get("type") != "score" or str(operation.get("operation_id") or "") != str(operation_id or ""):
+            return workflow_response_payload(manifest, state, "action_required", operation=operation, warnings=["评分结果的operation_id已过期或不匹配"])
+        run_status = str(result.get("run_status") or "")
+        terminal_status = "complete" if run_status == "complete" else "awaiting_user"
+        terminal = {
+            "workflow_status": terminal_status,
+            "result_json": str(result_path.resolve()),
+            "run_status": run_status,
+            "stopped_items": list(result.get("stopped_items") or []),
+            "user_actions": list(result.get("user_actions") or []),
+            "finished_at": utc_text(),
+        }
+        state["workflow"].setdefault("applied_operations", {})[operation_id] = {"applied_at": utc_text(), "type": "score"}
+        state["workflow"]["current_operation"] = {}
+        state["workflow"]["terminal"] = terminal
+        save_state(manifest, state)
+        payload = workflow_response_payload(manifest, state, terminal_status, extra=terminal)
+        if terminal.get("user_actions"):
+            payload["user_actions"] = terminal["user_actions"]
+        return payload
+
+
+def reset_workflow(manifest: dict[str, Any]) -> None:
+    with state_lock(manifest):
+        state = load_state(manifest)
+        state["workflow"].update({"current_operation": {}, "preflight": {}, "terminal": {}, "contract_errors": {}})
+        for entry in state.get("documents", {}).values():
+            entry.pop("preflight_status", None)
+            entry.pop("metadata_refresh_attempts", None)
+            if entry.get("status") != "removed":
+                entry.update({
+                    "status": "pending",
+                    "error": "",
+                    "error_kind": "",
+                    "attempts": 0,
+                    "next_attempt_at": "",
+                })
+        save_state(manifest, state)
+
+
+def workflow_next(manifest: dict[str, Any]) -> dict[str, Any]:
+    state = load_state(manifest)
+    terminal = state.get("workflow", {}).get("terminal") or {}
+    if terminal:
+        payload = workflow_response_payload(manifest, state, str(terminal.get("workflow_status") or "awaiting_user"), extra=terminal)
+        if terminal.get("user_actions"):
+            payload["user_actions"] = terminal["user_actions"]
+        return payload
+    current = state.get("workflow", {}).get("current_operation") or {}
+    if current:
+        status = "ready_to_score" if current.get("type") == "score" else "action_required"
+        return workflow_response_payload(manifest, state, status, operation=current)
+
+    initial_specs = document_specs(manifest, state, stage="initial")
+    initial_done = all(
+        state.get("documents", {}).get(spec["item_id"], {}).get("status") in {"success", "cached", "failed"}
+        for spec in initial_specs
+    )
+    stage = "students" if initial_done else "initial"
+    specs = document_specs(manifest, state, stage=stage)
+    if stage == "students" and not specs:
+        operation = create_workflow_operation(manifest, state, action_type="score", stage="score", specs=[])
+        return workflow_response_payload(manifest, load_state(manifest), "ready_to_score", operation=operation)
+
+    pending_preflight: list[dict[str, Any]] = []
+    waiting_preflight_retry: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
+    for spec in specs:
+        entry = state.get("documents", {}).get(spec["item_id"], {})
+        if entry.get("status") in {"success", "cached", "failed"}:
+            clone = dict(spec)
+            clone["preflight_ok"] = entry.get("status") in {"success", "cached"}
+            if entry.get("status") == "failed":
+                clone["workflow_terminal_failure"] = True
+            prepared.append(clone)
+            continue
+        if entry.get("preflight_status") not in {"ok", "error", "retry"}:
+            pending_preflight.append(spec)
+            clone = dict(spec)
+            clone["workflow_preflight_pending"] = True
+            prepared.append(clone)
+            continue
+        if entry.get("preflight_status") == "retry":
+            try:
+                next_attempt = datetime.fromisoformat(str(entry.get("next_attempt_at") or ""))
+            except ValueError:
+                next_attempt = utc_now()
+            clone = dict(spec)
+            clone["workflow_preflight_pending"] = True
+            prepared.append(clone)
+            if next_attempt > utc_now():
+                waiting_preflight_retry.append({**spec, "error": entry.get("error", ""), "error_kind": entry.get("error_kind", ""), "next_attempt_at": entry.get("next_attempt_at", "")})
+            else:
+                pending_preflight.append(spec)
+            continue
+        clone = dict(spec)
+        if entry.get("preflight_status") == "ok":
+            clone.update({key: entry.get(key, clone.get(key, "")) for key in ("revision", "sheet", "range")})
+            clone["preflight_ok"] = True
+        elif entry.get("preflight_status") in {"error", "retry"}:
+            clone["preflight_error"] = entry.get("error", "")
+            clone["preflight_error_kind"] = entry.get("error_kind", "")
+        prepared.append(clone)
+
+    plan = plan_reads(manifest, prepared)
+    state = load_state(manifest)
+    if plan["read"]:
+        operation = create_workflow_operation(manifest, state, action_type="read_docs", stage=stage, specs=plan["read"])
+        return workflow_response_payload(manifest, load_state(manifest), "action_required", operation=operation)
+    if pending_preflight:
+        operation = create_workflow_operation(manifest, state, action_type="preflight_docs", stage=stage, specs=pending_preflight)
+        return workflow_response_payload(manifest, load_state(manifest), "action_required", operation=operation)
+    if waiting_preflight_retry:
+        next_attempts = sorted(str(item.get("next_attempt_at") or "") for item in waiting_preflight_retry if item.get("next_attempt_at"))
+        return workflow_response_payload(
+            manifest,
+            state,
+            "retrying",
+            extra={"retry_items": waiting_preflight_retry, "next_attempt_at": next_attempts[0] if next_attempts else ""},
+        )
+    if plan["retry"]:
+        next_attempts = sorted(str(item.get("next_attempt_at") or "") for item in plan["retry"] if item.get("next_attempt_at"))
+        return workflow_response_payload(
+            manifest,
+            state,
+            "retrying",
+            extra={"retry_items": plan["retry"], "next_attempt_at": next_attempts[0] if next_attempts else ""},
+        )
+    if stage == "initial":
+        return workflow_next(manifest)
+    operation = create_workflow_operation(manifest, state, action_type="score", stage="score", specs=[])
+    status = "engineering_blocked" if any(item.get("stage") == "orchestration" for item in workflow_blocked_items(load_state(manifest))) else "ready_to_score"
+    return workflow_response_payload(manifest, load_state(manifest), status, operation=operation)
+
+
+def workflow_command(
+    manifest: dict[str, Any],
+    *,
+    response: Path | None = None,
+    evidence_dir: Path | None = None,
+    result_json: Path | None = None,
+    operation_id: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    if refresh:
+        reset_workflow(manifest)
+    warnings: list[str] = []
+    recoveries: list[str] = []
+    if result_json is not None:
+        return finalize_workflow_result(manifest, result_json, operation_id)
+    if evidence_dir is not None:
+        applied = apply_read_operation(manifest, evidence_dir, response)
+        warnings.extend(applied.get("warnings", []))
+        recoveries.extend(applied.get("recoveries", []))
+        if applied.get("contract_error"):
+            state = load_state(manifest)
+            status = "engineering_blocked" if applied.get("engineering_blocked") else "action_required"
+            return workflow_response_payload(
+                manifest,
+                state,
+                status,
+                operation=state["workflow"].get("current_operation") or None,
+                warnings=warnings + list(applied.get("contract_errors") or []),
+                recoveries=recoveries,
+            )
+    elif response is not None:
+        try:
+            response_payload = json.loads(response.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            response_payload = None
+        response_operation_id = str(response_payload.get("operation_id") or "") if isinstance(response_payload, dict) else ""
+        if response_operation_id and response_operation_id in load_state(manifest).get("workflow", {}).get("applied_operations", {}):
+            next_payload = workflow_next(manifest)
+            next_payload["recoveries"] = [f"已忽略重复提交的operation_id={response_operation_id}"] + list(next_payload.get("recoveries") or [])
+            return next_payload
+        applied = apply_preflight_operation(manifest, response)
+        warnings.extend(applied.get("warnings", []))
+        recoveries.extend(applied.get("recoveries", []))
+        if applied.get("contract_error"):
+            state = load_state(manifest)
+            status = "engineering_blocked" if applied.get("engineering_blocked") else "action_required"
+            return workflow_response_payload(
+                manifest,
+                state,
+                status,
+                operation=state["workflow"].get("current_operation") or None,
+                warnings=warnings + list(applied.get("contract_errors") or []),
+                recoveries=recoveries,
+            )
+    next_payload = workflow_next(manifest)
+    next_payload["warnings"] = warnings + list(next_payload.get("warnings") or [])
+    next_payload["recoveries"] = recoveries + list(next_payload.get("recoveries") or [])
+    return next_payload
+
+
 def cli() -> int:
     parser = ManifestArgumentParser(description="Manifest证据缓存与续跑状态管理")
     sub = parser.add_subparsers(dest="command", required=True)
+    capabilities = sub.add_parser("capabilities")
+    capabilities.add_argument("--json", action="store_true", help="输出机器可读能力契约")
+    workflow = sub.add_parser("workflow")
+    workflow.add_argument("--manifest", required=True, type=Path)
+    workflow.add_argument("--response", type=Path, help="当前预检或读取失败响应JSON")
+    workflow.add_argument("--evidence-dir", type=Path, help="当前read_docs操作的证据目录")
+    workflow.add_argument("--result-json", type=Path, help="当前score操作生成的评分JSON")
+    workflow.add_argument("--operation-id", default="", help="提交评分结果时回传的操作ID")
+    workflow.add_argument("--refresh", action="store_true", help="开始新一轮预检，保留已有证据缓存")
     specs = sub.add_parser("specs")
     specs.add_argument("--manifest", required=True, type=Path)
     specs.add_argument("--stage", choices=["initial", "students", "all"], default="all")
@@ -1018,8 +1810,23 @@ def cli() -> int:
     status = sub.add_parser("status")
     status.add_argument("--manifest", required=True, type=Path)
     args = parser.parse_args()
+    if args.command == "capabilities":
+        print(json.dumps(capabilities_payload(), ensure_ascii=False, indent=2))
+        return 0
     manifest = load_manifest(args.manifest)
-    if args.command == "specs":
+    if args.command == "workflow":
+        selected_inputs = sum(value is not None for value in (args.evidence_dir, args.result_json))
+        if selected_inputs > 1:
+            raise ManifestCliError("workflow每次只能提交证据目录或评分JSON中的一种")
+        print(json.dumps(workflow_command(
+            manifest,
+            response=args.response,
+            evidence_dir=args.evidence_dir,
+            result_json=args.result_json,
+            operation_id=args.operation_id,
+            refresh=args.refresh,
+        ), ensure_ascii=False, indent=2))
+    elif args.command == "specs":
         state = load_state(manifest)
         print(json.dumps({"schema_version": 1, "task_id": manifest["task_id"], "items": document_specs(manifest, state, stage=args.stage)}, ensure_ascii=False, indent=2))
     elif args.command == "plan":
@@ -1041,13 +1848,24 @@ def main() -> int:
     try:
         return cli()
     except Exception as exc:
+        recoverable = isinstance(exc, ManifestCliError)
+        invalid_command = exc.invalid_command if isinstance(exc, ManifestCliError) else ""
+        suggestion = ""
+        if invalid_command:
+            matches = difflib.get_close_matches(invalid_command, WORKFLOW_COMMANDS, n=1, cutoff=0.35)
+            suggestion = matches[0] if matches else "workflow"
         print(f"错误：{exc}", file=sys.stderr)
         print(json.dumps({
             "status": "stopped",
+            "error_code": "cli_contract_error" if recoverable else "manifest_error",
+            "recoverable": recoverable,
+            "valid_commands": list(WORKFLOW_COMMANDS) if recoverable else [],
+            "suggested_command": suggestion,
+            "suggested_retry_command": "python3 scripts/manifest_runtime.py capabilities --json" if invalid_command else "python3 scripts/manifest_runtime.py workflow --manifest /absolute/path/to/task.json",
             "stopped_items": [{
                 "stage": "manifest",
                 "reason": str(exc),
-                "next_action": "修复Manifest、证据、权限或读取状态后，复用同一 task_id 继续执行",
+                "next_action": "执行 capabilities --json 并使用workflow统一入口自动重试" if recoverable else "修复Manifest、证据、权限或读取状态后，复用同一 task_id 继续执行",
             }],
         }, ensure_ascii=False), file=sys.stderr)
         return 2

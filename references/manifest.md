@@ -93,7 +93,46 @@ Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sh
 
 `homework.layout_reuse.enabled=true` 时，不要在 `document_defaults.range` 中固定跨考核范围。`discovery_range` 只是首份作业的发现上界；首份证据必须记录实际最小范围。该范围仅保存在当前 `task_id` 的 `.score-cache/runs/`状态中，同一考核后续学员复用；新考核使用新 `task_id` 会重新学习。
 
+## 统一workflow接口
+
+Agent默认只调用 `capabilities --json` 和 `workflow`。`specs`、`plan`、`ingest`、`ingest-batch`、`fail`与`status`保留为兼容/调试接口，禁止Agent在任务中猜测新的底层命令。
+
+```bash
+python3 scripts/manifest_runtime.py capabilities --json
+python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json
+```
+
+`workflow` 每次返回 `workflow_status`、`operation_id`、`action`、`recoverable`、`blocked_items` 和 `user_actions`：
+
+- `action_required + preflight_docs`：填充 `action.response_template` 后使用 `--response`回传。
+- `action_required + read_docs`：将证据保存为 `<item_id>.json`，使用 `--evidence-dir` 回传；读取失败可同时放在 `--response`。
+- `retrying`：到 `next_attempt_at` 后再调用同一命令。
+- `ready_to_score + score`：执行评分，再使用 `--result-json` 和该 `operation_id` 回传结果。
+- `awaiting_user`或`complete`：终态。仅前者需一次性询问 `user_actions`。
+- `engineering_blocked`：同一本地契约错误连续3次后才允许终止，状态和证据保留。
+
+`operation_id` 是幂等键。重复回传已应用的操作只返回恢复说明，不重复计数或入库。过期 `operation_id`或`specs_hash`不得应用，运行时返回当前操作的正确模板续跑。
+
 ## 批量预检快照
+
+workflow v2 的标准预检快照为：
+
+```json
+{
+  "schema_version": 2,
+  "task_id": "group-29-quiz-text-to-video",
+  "stage": "students",
+  "operation_id": "operation-id",
+  "specs_hash": "specs-hash",
+  "items": [
+    {"item_id": "ITEM_A", "revision": "r15", "sheet": "作业", "range": "A1:AB11"}
+  ]
+}
+```
+
+运行时同时兼容顶层数组、`{"items": [...]}`、`item_id → revision`和“文档ID → revision”映射。文档ID只有在本轮唯一匹配时才自动转换；歧义、冲突或缺失项只重取对应文档，其他合法项继续。revision为空不是致命错误，但会禁用revision缓存并每次重读。
+
+以下底层快照说明仅用于兼容和调试。
 
 预检前先获取不修改状态的文档清单：
 
@@ -101,7 +140,7 @@ Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sh
 python3 scripts/manifest_runtime.py specs --manifest /path/to/task.json --stage students
 ```
 
-输出的 `items` 已包含稳定 `item_id`、文档ID和URL，批量Docs预检必须原样回传 `item_id`，避免Agent自行重算或逐份建立对应。快照必须完整覆盖本次 `specs` 的全部项，不能出现重复、未知或空 `item_id`；否则整批拒绝，防止部分预检被误当成全量成功。
+输出的 `items` 已包含稳定 `item_id`、文档ID和URL，批量Docs预检应原样回传 `item_id`，避免Agent自行重算或逐份建立对应。此处的旧 `plan --revisions` 接口仍要求快照完整、唯一且只含当前项；统一 `workflow` 接口不会整批拒绝，它会保留合法项并只重取缺失、歧义或冲突项。
 
 权限、revision和候选页签应在同一批预检中取得。标准答案和索引可同时提供已确认范围；显式开启 `layout_reuse` 的学员项即使快照带有大范围，运行时也会将它仅作为发现信息，强制用首份实际最小范围建立模板。成功项与失败项使用同一快照：
 
