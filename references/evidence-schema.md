@@ -65,15 +65,27 @@
 - `document.url`、`id`、`revision`、`sheet`、`range` 用于审计和缓存；没有 revision 时保留空字符串。
 - 不读取与目标表格无关的工作表和范围。
 
-评分脚本的 schema v3 结果 JSON 会在 `standard_answer_evidence` 中逐个记录 `dimension`、规范化 `id`、`raw_cell`、`keywords`、`standard_blank`、标准答案OCR置信度和原始行号；并包含：
+评分脚本的 schema v4 结果 JSON 会在 `standard_answer_evidence` 中逐个记录 `dimension`、规范化 `id`、`raw_cell`、`keywords`、`standard_blank`、标准答案OCR置信度和原始行号；并包含：
 
-- `run_status`：`complete`、`incomplete`、`pending_review` 或 `output_failed`；
+- `run_status`：`complete`、`incomplete`、`pending_review`、`output_failed` 或 `awaiting_standard_decision`；
 - `summary`、`details`、`anomalies`：汇总、逐题明细和异常；
+- `group_summary`：全组正确有效格、有效格总数和准确率；
 - `evidence`：文档 revision、工作表、范围和内容哈希索引；
 - `failed_documents`：失败或等待续跑的文档；
 - `stopped_items`：每个未继续分支的阶段、对象、明确原因和下一步；
 - `cache_stats`：证据和学员评分片段的命中/未命中数；
 - `metadata.scoring_rule_version`、`standard_hash`、`profile_hash`、`aliases_hash`：增量评分依据。
+
+非特殊维度出现标准空值时，结果必须在评分前进入 `awaiting_standard_decision`：
+
+- `decision_request.decision_key` 绑定标准答案 revision、完整内容与异常空值位置；
+- `affected_cells` 一次列出全部维度、ID、原始行号与单元格；
+- `summary/details` 为空，表示尚未计算任何学员准确率；
+- `preflight_review_items` 同时保留能在评分前确定的OCR待复核项，并与证据失败、标准空值一起写入 `stopped_items`；
+- `evidence` 和 `standard_answer_evidence` 保留已读取数据，正式Excel/PNG为空；
+- 用户确认继续后，正式结果以 `standard_blank_decision` 固化授权，明细结果为 `不计分`，维度通过 `source_total`、`total` 和 `excluded_ids` 审计实际分母。
+
+个人与全组准确率按全部有效评分格汇总，不再对有效题数不同的维度做等权平均。整维无有效格时状态为“未评分”；全部维度无有效格时结果为 `incomplete`。
 
 结果 JSON 是正式输出和后续渲染的唯一数据源。使用 `--result-json` 生成 PNG/Excel 时不再访问 Docs，不再评分。
 
@@ -83,5 +95,5 @@
 
 - revision 存在时，证据缓存键是 `role + student + document_id + revision + sheet + range` 的稳定哈希，禁止不同学员共享同一证据缓存项。
 - revision 为空时，不使用 revision 缓存盲目跳过读取；读取后以完整证据内容哈希保存。
-- 学员评分缓存键包含标准答案内容哈希、该学员作业内容哈希、考试配置哈希、评分规则版本和姓名别名哈希。
+- 学员评分缓存键包含标准答案内容哈希、该学员作业内容哈希、考试配置哈希、评分规则版本、姓名别名哈希、标准空值处理策略和decision key。
 - 任务状态以文档为单位记录 `pending/cached/success/failed/removed`、尝试次数、错误和缓存路径。每份证据成功后立即原子保存证据与状态。

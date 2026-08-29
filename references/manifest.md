@@ -161,4 +161,5 @@ python3 scripts/manifest_runtime.py ingest-batch \
 - `runtime.ocr_workers` 是API OCR并发数，默认4，只允许1–8；`runtime.ocr_confidence_threshold` 默认0.75。
 - `runtime.ocr_engine` 是 `auto|vision|api`；`auto` 在macOS使用Vision，其他系统使用API。
 - 截图标准答案与作业都必须逐题提供有效OCR置信度；任何待复核项都会停止正式PNG/Excel并写入 `stopped_items`。
+- 非特殊维度标准空值触发 `awaiting_standard_decision`（退出码6），保留全部证据缓存并暂停评分。用户选择审核后复用同一 `task_id`；选择继续时向 `run_assessment.py` 同时传 `--standard-blank-action exclude` 和暂停JSON中的 `--standard-blank-decision-key`。键与标准答案版本不匹配时重新暂停，禁止沿用旧授权。
 - 作业索引变化后，已删除学员标记为 `removed`，新增或链接变化的学员创建新读取项，未变学员继续复用缓存。

@@ -52,7 +52,7 @@ else:
     CONFIG_PATH = SKILL_ROOT / "references" / "exam_profiles.json"
     VISION_SCRIPT = SKILL_ROOT / "scripts" / "ocr_vision.swift"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
-SCORING_RULE_VERSION = "2026-08-27-evidence-and-ocr-v3"
+SCORING_RULE_VERSION = "2026-08-29-standard-blank-gate-v4"
 STANDARD_ANSWER_DELIMITER = re.compile(r"[\r\n,，、/／|｜]+")
 STANDARD_COLLECTION_KEYS = ("values", "options", "labels", "items", "selected", "selections", "tags")
 STANDARD_SCALAR_KEYS = ("text", "label", "name", "title", "display_value", "displayValue", "value")
@@ -392,6 +392,171 @@ def standard_answer_evidence(
     return entries
 
 
+def standard_payload_for_hash(
+    standard: dict[str, OrderedDict[str, dict[str, Any]]],
+    dimensions: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    return {
+        dimension: [
+            {
+                "id": row_id,
+                "raw": answer.get("raw_value"),
+                "keywords": list(answer.get("keywords") or []),
+                "source": answer.get("source"),
+                "confidence": answer.get("confidence"),
+                "confidence_issue": answer.get("confidence_issue"),
+            }
+            for row_id, answer in standard[dimension].items()
+        ]
+        for dimension in dimensions
+    }
+
+
+def unexpected_standard_blanks(
+    standard: dict[str, OrderedDict[str, dict[str, Any]]],
+    dimensions: list[str],
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    allowed = set(config.get("blank_standard_allowed") or [])
+    issues: list[dict[str, Any]] = []
+    for dimension in dimensions:
+        if dimension in allowed:
+            continue
+        for row_id, answer in standard[dimension].items():
+            if answer.get("keywords") is None:
+                issues.append({
+                    "dimension": dimension,
+                    "id": row_id,
+                    "row_number": answer.get("row_number"),
+                    "raw_cell": answer.get("raw_value"),
+                    "source": answer.get("source", ""),
+                })
+    return issues
+
+
+def standard_blank_decision_key(
+    standard: dict[str, OrderedDict[str, dict[str, Any]]],
+    dimensions: list[str],
+    issues: list[dict[str, Any]],
+    standard_documents: list[dict[str, Any]] | None = None,
+) -> str:
+    source_versions = [
+        {
+            "document_id": item["document_id"],
+            "revision": item["revision"],
+            "sheet": item["sheet"],
+            "range": item["range"],
+            "content_sha256": item["content_sha256"],
+        }
+        for item in evidence_index(standard_documents or [])
+    ]
+    return stable_hash({
+        "standard": standard_payload_for_hash(standard, dimensions),
+        "standard_source_versions": source_versions,
+        "unexpected_standard_blanks": [
+            {"dimension": item["dimension"], "id": item["id"], "row_number": item.get("row_number")}
+            for item in issues
+        ],
+    })
+
+
+def standard_blank_decision_request(
+    issues: list[dict[str, Any]],
+    decision_key: str,
+    provided_action: str | None = None,
+    provided_key: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "unexpected_standard_blank",
+        "question": "标准答案在非特殊维度出现空值。请选择审核标准答案，或确认继续计算并逐格排除这些空值。",
+        "decision_key": decision_key,
+        "provided_action": provided_action or "",
+        "provided_key_valid": bool(provided_action == "exclude" and provided_key == decision_key),
+        "data_retained": True,
+        "affected_cells": issues,
+        "options": [
+            {
+                "id": "review_standard",
+                "label": "审核标准答案",
+                "description": "修订标准答案后复用同一Manifest和task_id续跑；未变化的学员证据继续使用缓存。",
+            },
+            {
+                "id": "continue_excluding",
+                "label": "继续计算准确率",
+                "description": "使用当前decision_key逐格排除这些空值，不判对错且不进入任何准确率分母。",
+            },
+        ],
+    }
+
+
+def ocr_review_items_before_scoring(
+    standard: dict[str, OrderedDict[str, dict[str, Any]]],
+    homework_documents: list[dict[str, Any]],
+    dimensions: list[str],
+    config: dict[str, Any],
+    aliases: dict[str, str],
+    threshold: float,
+) -> list[dict[str, str]]:
+    """Collect OCR review stops without parsing answers or calculating accuracy."""
+    review_items: list[dict[str, str]] = []
+
+    def add(*, role: str, student: str, dimension: str, row_id: str, reason: str) -> None:
+        review_items.append({
+            "stage": "ocr_review",
+            "role": role,
+            "student": student,
+            "dimension": dimension,
+            "id": row_id,
+            "reason": reason,
+            "next_action": "人工核对该评分格，或提供更清晰截图后重新OCR",
+        })
+
+    for dimension in dimensions:
+        for row_id, expected in standard[dimension].items():
+            if expected.get("source") != "image_ocr":
+                continue
+            if expected.get("confidence_issue"):
+                add(
+                    role="standard",
+                    student="",
+                    dimension=dimension,
+                    row_id=row_id,
+                    reason="标准答案OCR置信度无效：" + str(expected["confidence_issue"]),
+                )
+            elif expected.get("confidence") is not None and float(expected["confidence"]) < threshold:
+                add(
+                    role="standard",
+                    student="",
+                    dimension=dimension,
+                    row_id=row_id,
+                    reason=f"标准答案OCR置信度 {float(expected['confidence']):.3f} 低于阈值 {threshold:.3f}",
+                )
+
+    for doc in homework_documents:
+        if doc.get("source") != "image_ocr":
+            continue
+        headers = doc["headers"]
+        id_index = int(resolve_header(headers, config["id_headers"], "ID", True))
+        name_index = resolve_header(headers, config["student_name_headers"], "同学名称", False)
+        document_name = normalize_name(doc.get("student_name"), aliases)
+        for row in doc["rows"]:
+            row_id = normalize_id(row[id_index])
+            if not row_id:
+                continue
+            student = normalize_name(row[name_index], aliases) if name_index is not None else document_name
+            confidence, confidence_issue = confidence_for_row(doc, row_id)
+            if confidence_issue:
+                reason = "学员答案OCR置信度无效：" + confidence_issue
+            elif confidence is not None and float(confidence) < threshold:
+                reason = f"OCR置信度 {float(confidence):.3f} 低于阈值 {threshold:.3f}"
+            else:
+                continue
+            for dimension in dimensions:
+                if row_id in standard[dimension]:
+                    add(role="homework", student=student, dimension=dimension, row_id=row_id, reason=reason)
+    return review_items
+
+
 def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], config: dict[str, Any]) -> dict[str, OrderedDict[str, dict[str, Any]]]:
     standard: dict[str, OrderedDict[str, dict[str, Any]]] = {dim: OrderedDict() for dim in dimensions}
     seen_ids: set[str] = set()
@@ -414,9 +579,6 @@ def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], confi
             for dimension, index in dim_indexes.items():
                 raw = row[index]
                 keywords = standard_answer_keywords(raw)
-                blank_allowed = set(config.get("blank_standard_allowed") or [])
-                if keywords is None and dimension not in blank_allowed:
-                    raise AssessmentError(f"标准答案 ID {row_id} 的“{dimension}”为空；该维度不允许标准空值")
                 standard[dimension][row_id] = {
                     "raw": display_cell_value(raw),
                     "raw_value": raw,
@@ -750,7 +912,9 @@ def score_students(
     dimensions: list[str],
     base_anomalies: list[dict[str, Any]],
     ocr_confidence_threshold: float = 0.75,
+    excluded_blank_cells: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
+    excluded_blank_cells = excluded_blank_cells or set()
     details: list[dict[str, Any]] = []
     anomalies = list(base_anomalies)
     summaries: list[dict[str, Any]] = []
@@ -764,6 +928,7 @@ def score_students(
             correct_count = 0
             wrong_ids: list[str] = []
             review_ids: list[str] = []
+            excluded_ids: list[str] = []
             pending = False
 
             extras = [row_id for row_id in actual_map if row_id not in expected_map]
@@ -779,7 +944,11 @@ def score_students(
                 reason = ""
                 result = "错误"
 
-                if actual is None:
+                if (dimension, row_id) in excluded_blank_cells:
+                    result = "不计分"
+                    reason = "用户已确认继续计算：该异常标准空值格逐格排除，不进入任何准确率分母"
+                    excluded_ids.append(row_id)
+                elif actual is None:
                     reason = "缺失ID"
                     anomalies.append({"student": student.name, "type": "缺失ID", "dimension": dimension, "id": row_id, "detail": "按未答计错"})
                 elif expected.get("confidence_issue"):
@@ -847,31 +1016,49 @@ def score_students(
                     }
                 )
 
-            total = len(expected_map)
-            accuracy = None if pending else correct_count / total
+            source_total = len(expected_map)
+            total = source_total - len(excluded_ids)
+            accuracy = None if pending or total == 0 else correct_count / total
             dim_summaries[dimension] = {
                 "correct": correct_count,
                 "total": total,
+                "source_total": source_total,
                 "accuracy": accuracy,
                 "wrong_ids": wrong_ids,
                 "review_ids": review_ids,
-                "status": "待复核" if pending else "已完成",
+                "excluded_ids": excluded_ids,
+                "status": "待复核" if pending else ("未评分" if total == 0 else "已完成"),
             }
             any_pending = any_pending or pending
 
-        accuracies = [dim_summaries[dimension]["accuracy"] for dimension in dimensions]
-        overall = None if any(value is None for value in accuracies) else sum(accuracies) / len(accuracies)
+        overall_correct = sum(dim_summaries[dimension]["correct"] for dimension in dimensions)
+        overall_total = sum(dim_summaries[dimension]["total"] for dimension in dimensions)
+        overall = None if any_pending or overall_total == 0 else overall_correct / overall_total
         summaries.append(
             {
                 "student": student.name,
-                "status": "待复核" if any_pending else "已完成",
+                "status": "待复核" if any_pending else ("未评分" if overall_total == 0 else "已完成"),
                 "dimensions": dim_summaries,
                 "overall_accuracy": overall,
+                "overall_correct": overall_correct,
+                "overall_total": overall_total,
                 "source_order": student.source_order,
             }
         )
 
-    return {"summary": summaries, "details": details, "anomalies": anomalies}
+    group_correct = sum(item["overall_correct"] for item in summaries)
+    group_total = sum(item["overall_total"] for item in summaries)
+    group_pending = any(item["status"] == "待复核" for item in summaries)
+    return {
+        "summary": summaries,
+        "details": details,
+        "anomalies": anomalies,
+        "group_summary": {
+            "correct": group_correct,
+            "total": group_total,
+            "accuracy": None if group_pending or group_total == 0 else group_correct / group_total,
+        },
+    }
 
 
 def scoring_fingerprint(
@@ -880,26 +1067,17 @@ def scoring_fingerprint(
     profile: dict[str, Any],
     aliases: dict[str, str],
     ocr_confidence_threshold: float,
+    standard_blank_policy: str = "none",
+    standard_blank_decision_key_value: str = "",
 ) -> dict[str, str]:
-    standard_payload = {
-        dimension: [
-            {
-                "id": row_id,
-                "raw": answer.get("raw_value"),
-                "keywords": list(answer.get("keywords") or []),
-                "source": answer.get("source"),
-                "confidence": answer.get("confidence"),
-                "confidence_issue": answer.get("confidence_issue"),
-            }
-            for row_id, answer in standard[dimension].items()
-        ]
-        for dimension in dimensions
-    }
+    standard_payload = standard_payload_for_hash(standard, dimensions)
     return {
         "standard_hash": stable_hash(standard_payload),
         "profile_hash": stable_hash(profile),
         "aliases_hash": stable_hash(aliases),
         "ocr_threshold_hash": stable_hash(ocr_confidence_threshold),
+        "standard_blank_policy": standard_blank_policy,
+        "standard_blank_decision_key": standard_blank_decision_key_value,
         "scoring_rule_version": SCORING_RULE_VERSION,
     }
 
@@ -930,10 +1108,21 @@ def score_students_incremental(
     aliases: dict[str, str],
     score_cache_dir: Path | None,
     ocr_confidence_threshold: float = 0.75,
+    excluded_blank_cells: set[tuple[str, str]] | None = None,
+    standard_blank_policy: str = "none",
+    standard_blank_decision_key_value: str = "",
 ) -> tuple[dict[str, Any], dict[str, int], dict[str, str]]:
-    fingerprint = scoring_fingerprint(standard, dimensions, profile, aliases, ocr_confidence_threshold)
+    fingerprint = scoring_fingerprint(
+        standard,
+        dimensions,
+        profile,
+        aliases,
+        ocr_confidence_threshold,
+        standard_blank_policy,
+        standard_blank_decision_key_value,
+    )
     if score_cache_dir is None:
-        scored = score_students(standard, students, dimensions, base_anomalies, ocr_confidence_threshold)
+        scored = score_students(standard, students, dimensions, base_anomalies, ocr_confidence_threshold, excluded_blank_cells)
         return scored, {"hits": 0, "misses": len(students)}, fingerprint
 
     score_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -960,6 +1149,7 @@ def score_students_incremental(
                 dimensions,
                 relevant_anomalies,
                 ocr_confidence_threshold,
+                excluded_blank_cells,
             )
             atomic_write_json(cache_path, fragment)
             misses += 1
@@ -971,6 +1161,14 @@ def score_students_incremental(
         merged["details"].extend(fragment.get("details", []))
         merged["anomalies"].extend(fragment.get("anomalies", []))
     merged["summary"].sort(key=lambda item: item.get("source_order", 0))
+    group_correct = sum(item.get("overall_correct", 0) for item in merged["summary"])
+    group_total = sum(item.get("overall_total", 0) for item in merged["summary"])
+    group_pending = any(item.get("status") == "待复核" for item in merged["summary"])
+    merged["group_summary"] = {
+        "correct": group_correct,
+        "total": group_total,
+        "accuracy": None if group_pending or group_total == 0 else group_correct / group_total,
+    }
     return merged, {"hits": hits, "misses": misses}, fingerprint
 
 
@@ -996,6 +1194,12 @@ def percent_text(rate: float | None, decimals: int = 0) -> str:
     if decimals == 0 or abs(value - round(value)) < 1e-9:
         return f"{value:.0f}%"
     return f"{value:.{decimals}f}%"
+
+
+def accuracy_text(rate: float | None, status: str, decimals: int = 0) -> str:
+    if rate is None and status == "未评分":
+        return "未评分"
+    return percent_text(rate, decimals)
 
 
 def find_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -1070,7 +1274,7 @@ def render_png(result: dict[str, Any], output_path: Path) -> None:
         headers = ["同学", "答对数", f"{dimension}准确率", "错误 ID"]
     else:
         widths = [110, 140, 170] + [190 if len(dim) <= 7 else 220 for dim in dimensions] + [170]
-        headers = ["组别", "进度", "姓名"] + [wrap_chars(dim, 7) for dim in dimensions] + [wrap_chars(f"{len(dimensions)}维度平均准确率", 7)]
+        headers = ["组别", "进度", "姓名"] + [wrap_chars(dim, 7) for dim in dimensions] + [wrap_chars("总准确率（有效格汇总）", 7)]
 
     width = sum(widths) + margin * 2
     height = margin * 2 + title_height + header_height + row_height * len(summaries) + legend_height
@@ -1094,8 +1298,9 @@ def render_png(result: dict[str, Any], output_path: Path) -> None:
         for row_index, summary in enumerate(summaries):
             top = table_top + header_height + row_index * row_height
             dim = summary["dimensions"][dimension]
-            wrong = dim["wrong_ids"] + [f"{item}*" for item in dim["review_ids"]]
-            values = [summary["student"], f"{dim['correct']}/{dim['total']}" if dim["accuracy"] is not None else "待复核", percent_text(dim["accuracy"], 2), ", ".join(wrong) or "—"]
+            wrong = dim["wrong_ids"] + [f"{item}*" for item in dim["review_ids"]] + [f"{item}(排除)" for item in dim.get("excluded_ids", [])]
+            count_text = "未评分" if dim.get("status") == "未评分" else (f"{dim['correct']}/{dim['total']}" if dim["accuracy"] is not None else "待复核")
+            values = [summary["student"], count_text, accuracy_text(dim["accuracy"], dim.get("status", ""), 2), ", ".join(wrong) or "—"]
             fills = [COLORS["body"], COLORS["body"], score_fill(dim["accuracy"]), COLORS["body"]]
             x = margin
             for col_index, (value, column_width, fill) in enumerate(zip(values, widths, fills)):
@@ -1109,9 +1314,10 @@ def render_png(result: dict[str, Any], output_path: Path) -> None:
             top = table_top + header_height + row_index * row_height
             values: list[tuple[str, str]] = [(summary["student"], COLORS["body"])]
             for dimension in dimensions:
-                rate = summary["dimensions"][dimension]["accuracy"]
-                values.append((percent_text(rate, 2), score_fill(rate)))
-            values.append((percent_text(summary["overall_accuracy"], 2), score_fill(summary["overall_accuracy"])))
+                dim = summary["dimensions"][dimension]
+                rate = dim["accuracy"]
+                values.append((accuracy_text(rate, dim.get("status", ""), 2), score_fill(rate)))
+            values.append((accuracy_text(summary["overall_accuracy"], summary.get("status", ""), 2), score_fill(summary["overall_accuracy"])))
             x = data_left
             for col_index, ((value, fill), column_width) in enumerate(zip(values, widths[2:])):
                 box = (x, top, x + column_width, top + row_height)
@@ -1171,6 +1377,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ocr-engine", choices=["auto", "vision", "api"], default="auto")
     parser.add_argument("--ocr-workers", type=int, default=4)
     parser.add_argument("--ocr-confidence-threshold", type=float, default=0.75)
+    parser.add_argument("--standard-blank-action", choices=["exclude"], help="用户确认继续后，逐格排除非特殊维度的标准空值")
+    parser.add_argument("--standard-blank-decision-key", help="暂停JSON返回的标准空值决策键；必须与当前标准版本完全一致")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summary-only", action="store_true", help="仅保存评分JSON并输出文字摘要")
     parser.add_argument("--png", choices=["on", "off"], default=None)
@@ -1246,14 +1454,37 @@ def stopped_items_for(result: dict[str, Any], warnings: list[str] | None = None)
             seen.add(key)
             stopped.append(normalized)
 
+    decision_request = result.get("decision_request")
+    if isinstance(decision_request, dict) and decision_request.get("type") == "unexpected_standard_blank":
+        if decision_request.get("provided_action") == "exclude" and not decision_request.get("provided_key_valid"):
+            add({
+                "stage": "standard_answer_review",
+                "role": "standard",
+                "reason": "继续计算使用的decision_key缺失或与当前标准答案版本不匹配，未执行评分",
+                "next_action": "使用本次暂停JSON返回的新decision_key重新确认，或审核并修订标准答案",
+            })
+        for issue in decision_request.get("affected_cells", []):
+            if not isinstance(issue, dict):
+                continue
+            add({
+                "stage": "standard_answer_review",
+                "role": "standard",
+                "dimension": issue.get("dimension", ""),
+                "id": issue.get("id", ""),
+                "reason": "标准答案在非特殊维度为空，已在准确率计算前暂停并保留全部已读取证据",
+                "next_action": "请选择“审核标准答案”后修订并续跑，或选择“继续计算准确率”并使用decision_key逐格排除",
+            })
     for failed in result.get("failed_documents", []):
         add({
-            "stage": "evidence",
+            "stage": failed.get("stage") or "evidence",
             "role": failed.get("role", ""),
             "student": failed.get("student", ""),
             "reason": failed.get("error") or "证据未就绪",
-            "next_action": "修复权限、链接、结构或读取失败后，复用同一 task_id 继续运行",
+            "next_action": failed.get("next_action") or "修复权限、链接、结构或读取失败后，复用同一 task_id 继续运行",
         })
+    for review in result.get("preflight_review_items", []):
+        if isinstance(review, dict):
+            add(review)
     for detail in result.get("details", []):
         if detail.get("result") == "待复核":
             add({
@@ -1266,7 +1497,7 @@ def stopped_items_for(result: dict[str, Any], warnings: list[str] | None = None)
                 "next_action": "人工核对该评分格，或提供更清晰截图后重新OCR",
             })
     for warning in warnings or []:
-        if warning.startswith(("任务证据不完整", "存在待复核")):
+        if warning.startswith(("任务证据不完整", "存在待复核", "标准答案存在异常空值")):
             continue
         add({
             "stage": "output",
@@ -1282,13 +1513,16 @@ def _finite_number(value: Any) -> bool:
 
 
 def validate_result_schema(result: Any) -> dict[str, Any]:
-    if not isinstance(result, dict) or result.get("schema_version") not in {1, 2, 3}:
-        raise AssessmentError("评分JSON必须是 schema_version=1、2或3 的对象")
+    if not isinstance(result, dict) or result.get("schema_version") not in {1, 2, 3, 4}:
+        raise AssessmentError("评分JSON必须是 schema_version=1、2、3或4 的对象")
+    schema_version = int(result["schema_version"])
     if "run_status" not in result:
         raise AssessmentError("评分JSON缺少 run_status，禁止默认视为 complete")
     run_status = result.get("run_status")
-    if run_status not in {"complete", "incomplete", "pending_review", "output_failed"}:
-        raise AssessmentError("评分JSON run_status 必须是 complete、incomplete、pending_review 或 output_failed")
+    if run_status not in {"complete", "incomplete", "pending_review", "output_failed", "awaiting_standard_decision"}:
+        raise AssessmentError("评分JSON run_status 必须是 complete、incomplete、pending_review、output_failed 或 awaiting_standard_decision")
+    if run_status == "awaiting_standard_decision" and schema_version != 4:
+        raise AssessmentError("awaiting_standard_decision 仅允许使用 schema_version=4")
     metadata = result.get("metadata")
     if not isinstance(metadata, dict):
         raise AssessmentError("评分JSON缺少 metadata 对象")
@@ -1305,10 +1539,28 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
     if not isinstance(result.get("cache_stats"), dict):
         raise AssessmentError("评分JSON cache_stats 必须是对象")
 
+    if schema_version == 4 and not isinstance(result.get("group_summary"), dict):
+        raise AssessmentError("schema v4 评分JSON必须包含 group_summary 对象")
     if run_status in {"complete", "pending_review", "output_failed"} and not result["summary"]:
         raise AssessmentError(f"评分JSON run_status={run_status} 时必须至少包含一名学员")
-    if run_status in {"complete", "pending_review", "output_failed"} and (not result["evidence"] or not result["standard_answer_evidence"]):
+    if run_status in {"complete", "pending_review", "output_failed", "awaiting_standard_decision"} and (not result["evidence"] or not result["standard_answer_evidence"]):
         raise AssessmentError(f"评分JSON run_status={run_status} 时必须保留完整证据索引和标准答案证据")
+    if run_status == "awaiting_standard_decision":
+        if result["summary"] or result["details"]:
+            raise AssessmentError("awaiting_standard_decision 时不得提前生成学员汇总或逐题评分")
+        request = result.get("decision_request")
+        if not isinstance(request, dict) or request.get("type") != "unexpected_standard_blank":
+            raise AssessmentError("awaiting_standard_decision 时必须包含标准空值 decision_request")
+        request_key = str(request.get("decision_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", request_key) or not isinstance(request.get("affected_cells"), list) or not request["affected_cells"]:
+            raise AssessmentError("标准空值 decision_request 必须包含decision_key和affected_cells")
+        if any(not isinstance(item, dict) or not str(item.get("dimension") or "").strip() or not str(item.get("id") or "").strip() for item in request["affected_cells"]):
+            raise AssessmentError("标准空值 affected_cells 每项必须包含维度和ID")
+        if request_key != metadata.get("standard_blank_decision_key"):
+            raise AssessmentError("标准空值 decision_request与metadata中的决策键不一致")
+        option_ids = {str(item.get("id") or "") for item in request.get("options", []) if isinstance(item, dict)}
+        if option_ids != {"review_standard", "continue_excluding"}:
+            raise AssessmentError("标准空值 decision_request 必须提供审核和继续两个选择")
     if run_status == "complete" and result["failed_documents"]:
         raise AssessmentError("评分JSON complete 时 failed_documents 必须为空")
     if any(not isinstance(item, dict) or not str(item.get("error") or "").strip() for item in result["failed_documents"]):
@@ -1329,26 +1581,42 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
             raise AssessmentError(f"评分JSON summary 第{index}项缺少维度：{', '.join(missing)}")
         accuracies: list[float | None] = []
         student_pending = False
+        expected_overall_correct = 0
+        expected_overall_total = 0
         for dimension in dimensions:
             dim = item["dimensions"][dimension]
             if not isinstance(dim, dict):
                 raise AssessmentError(f"评分JSON {student}/{dimension} 必须是对象")
             correct, total, accuracy = dim.get("correct"), dim.get("total"), dim.get("accuracy")
             wrong_ids, review_ids = dim.get("wrong_ids"), dim.get("review_ids")
-            if isinstance(correct, bool) or not isinstance(correct, int) or isinstance(total, bool) or not isinstance(total, int) or total <= 0 or not 0 <= correct <= total:
+            excluded_ids = dim.get("excluded_ids", []) if schema_version == 4 else []
+            source_total = dim.get("source_total", total) if schema_version == 4 else total
+            minimum_total = 0 if schema_version == 4 else 1
+            if isinstance(correct, bool) or not isinstance(correct, int) or isinstance(total, bool) or not isinstance(total, int) or total < minimum_total or not 0 <= correct <= total:
                 raise AssessmentError(f"评分JSON {student}/{dimension} 的 correct/total 非法")
-            if not isinstance(wrong_ids, list) or not isinstance(review_ids, list):
-                raise AssessmentError(f"评分JSON {student}/{dimension} 的 wrong_ids/review_ids 必须是数组")
+            if not isinstance(wrong_ids, list) or not isinstance(review_ids, list) or not isinstance(excluded_ids, list):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的 wrong_ids/review_ids/excluded_ids 必须是数组")
+            if isinstance(source_total, bool) or not isinstance(source_total, int) or source_total < total:
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的 source_total 非法")
             wrong = [str(value) for value in wrong_ids]
             review = [str(value) for value in review_ids]
-            if len(wrong) != len(set(wrong)) or len(review) != len(set(review)) or set(wrong) & set(review):
-                raise AssessmentError(f"评分JSON {student}/{dimension} 的错误ID或复核ID重复/冲突")
+            excluded = [str(value) for value in excluded_ids]
+            if len(wrong) != len(set(wrong)) or len(review) != len(set(review)) or len(excluded) != len(set(excluded)) or set(wrong) & set(review) or set(wrong) & set(excluded) or set(review) & set(excluded):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的错误ID、复核ID或排除ID重复/冲突")
             if correct + len(wrong) + len(review) != total:
                 raise AssessmentError(f"评分JSON {student}/{dimension} 的正确、错误、复核数量与total不一致")
+            if schema_version == 4 and source_total != total + len(excluded):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的source_total与排除数量不一致")
+            expected_overall_correct += correct
+            expected_overall_total += total
             if review:
                 if accuracy is not None or dim.get("status") != "待复核":
                     raise AssessmentError(f"评分JSON {student}/{dimension} 有review_ids时必须为待复核且accuracy=null")
                 student_pending = True
+                accuracies.append(None)
+            elif total == 0:
+                if accuracy is not None or dim.get("status") != "未评分":
+                    raise AssessmentError(f"评分JSON {student}/{dimension} 分母为0时必须标记未评分且accuracy=null")
                 accuracies.append(None)
             else:
                 if not _finite_number(accuracy) or not 0 <= float(accuracy) <= 1 or abs(float(accuracy) - correct / total) > 1e-9:
@@ -1356,11 +1624,19 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
                 if dim.get("status") != "已完成":
                     raise AssessmentError(f"评分JSON {student}/{dimension} 无复核项时状态必须为已完成")
                 accuracies.append(float(accuracy))
-        expected_overall = None if student_pending else sum(value for value in accuracies if value is not None) / len(accuracies)
-        if expected_overall is None:
+        if schema_version == 4:
+            if item.get("overall_correct") != expected_overall_correct or item.get("overall_total") != expected_overall_total:
+                raise AssessmentError(f"评分JSON {student} 的overall_correct/overall_total与维度汇总不一致")
+            expected_overall = None if student_pending or expected_overall_total == 0 else expected_overall_correct / expected_overall_total
+        else:
+            expected_overall = None if student_pending else sum(value for value in accuracies if value is not None) / len(accuracies)
+        if student_pending:
             if item.get("overall_accuracy") is not None or item.get("status") != "待复核":
                 raise AssessmentError(f"评分JSON {student} 存在复核维度时总状态必须待复核且总准确率为空")
             pending_seen = True
+        elif expected_overall is None:
+            if item.get("overall_accuracy") is not None or item.get("status") != "未评分":
+                raise AssessmentError(f"评分JSON {student} 无有效评分格时必须标记未评分且总准确率为空")
         elif not _finite_number(item.get("overall_accuracy")) or abs(float(item["overall_accuracy"]) - expected_overall) > 1e-9 or item.get("status") != "已完成":
             raise AssessmentError(f"评分JSON {student} 的总准确率或状态不一致")
 
@@ -1376,10 +1652,11 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
         if student not in summaries_by_student:
             raise AssessmentError(f"评分JSON details 出现summary中不存在的学员：{student}")
         outcome = detail.get("result")
-        if outcome not in {"正确", "错误", "待复核"}:
+        allowed_outcomes = {"正确", "错误", "待复核", "不计分"} if schema_version == 4 else {"正确", "错误", "待复核"}
+        if outcome not in allowed_outcomes:
             raise AssessmentError(f"评分JSON details 第{index}项结果非法")
         detail_keys.add(key)
-        counts = detail_counts.setdefault((student, dimension), {"正确": 0, "错误": [], "待复核": []})
+        counts = detail_counts.setdefault((student, dimension), {"正确": 0, "错误": [], "待复核": [], "不计分": []})
         if outcome == "正确":
             counts["正确"] += 1
         else:
@@ -1388,11 +1665,47 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
     for student, item in summaries_by_student.items():
         for dimension in dimensions:
             dim = item["dimensions"][dimension]
-            counts = detail_counts.get((student, dimension), {"正确": 0, "错误": [], "待复核": []})
-            if counts["正确"] != dim["correct"] or set(counts["错误"]) != {str(value) for value in dim["wrong_ids"]} or set(counts["待复核"]) != {str(value) for value in dim["review_ids"]}:
+            counts = detail_counts.get((student, dimension), {"正确": 0, "错误": [], "待复核": [], "不计分": []})
+            if counts["正确"] != dim["correct"] or set(counts["错误"]) != {str(value) for value in dim["wrong_ids"]} or set(counts["待复核"]) != {str(value) for value in dim["review_ids"]} or set(counts["不计分"]) != {str(value) for value in dim.get("excluded_ids", [])}:
                 raise AssessmentError(f"评分JSON {student}/{dimension} 的summary与逐题明细不一致")
             if counts["正确"] + len(counts["错误"]) + len(counts["待复核"]) != dim["total"]:
                 raise AssessmentError(f"评分JSON {student}/{dimension} 的逐题明细数量与total不一致")
+            if schema_version == 4 and dim["source_total"] != dim["total"] + len(counts["不计分"]):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的逐题明细数量与source_total不一致")
+
+    if schema_version == 4:
+        group = result["group_summary"]
+        group_correct = sum(item.get("overall_correct", 0) for item in result["summary"])
+        group_total = sum(item.get("overall_total", 0) for item in result["summary"])
+        if isinstance(group.get("correct"), bool) or not isinstance(group.get("correct"), int) or isinstance(group.get("total"), bool) or not isinstance(group.get("total"), int):
+            raise AssessmentError("评分JSON group_summary.correct/total必须是整数")
+        if group.get("correct") != group_correct or group.get("total") != group_total:
+            raise AssessmentError("评分JSON group_summary与学员汇总不一致")
+        expected_group_accuracy = None if pending_seen or group_total == 0 else group_correct / group_total
+        if expected_group_accuracy is None:
+            if group.get("accuracy") is not None:
+                raise AssessmentError("评分JSON group_summary在待复核或无有效格时accuracy必须为空")
+        elif not _finite_number(group.get("accuracy")) or abs(float(group["accuracy"]) - expected_group_accuracy) > 1e-9:
+            raise AssessmentError("评分JSON group_summary准确率与有效格汇总不一致")
+
+        decision = result.get("standard_blank_decision")
+        excluded_any = any(
+            item["dimensions"][dimension].get("excluded_ids")
+            for item in result["summary"]
+            for dimension in dimensions
+        )
+        if excluded_any:
+            if not isinstance(decision, dict) or decision.get("action") != "exclude" or not re.fullmatch(r"[0-9a-f]{64}", str(decision.get("decision_key") or "")) or not isinstance(decision.get("affected_cells"), list):
+                raise AssessmentError("评分JSON存在排除格时必须包含完整standard_blank_decision")
+            if decision["decision_key"] != metadata.get("standard_blank_decision_key"):
+                raise AssessmentError("评分JSON standard_blank_decision与metadata中的决策键不一致")
+            affected = {(str(cell.get("dimension") or ""), str(cell.get("id") or "")) for cell in decision["affected_cells"] if isinstance(cell, dict)}
+            if not affected or any(
+                {(dimension, str(row_id)) for row_id in item["dimensions"][dimension].get("excluded_ids", [])} != {pair for pair in affected if pair[0] == dimension}
+                for item in result["summary"]
+                for dimension in dimensions
+            ):
+                raise AssessmentError("评分JSON standard_blank_decision与各学员excluded_ids不一致")
 
     source_mode = metadata.get("source_mode")
     if source_mode in {"docs", "images"}:
@@ -1414,6 +1727,8 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
         raise AssessmentError(f"评分JSON {run_status} 时必须在 stopped_items 说明停止原因")
     if run_status == "output_failed" and not any(item.get("stage") == "output" for item in result.get("stopped_items", [])):
         raise AssessmentError("评分JSON output_failed 时必须说明输出阶段的停止原因")
+    if run_status == "awaiting_standard_decision" and not any(item.get("stage") == "standard_answer_review" for item in result.get("stopped_items", [])):
+        raise AssessmentError("awaiting_standard_decision 时必须逐项说明标准答案空值停止原因")
     return result
 
 
@@ -1428,7 +1743,12 @@ def emit_optional_outputs(
     warnings: list[str] = []
     hard_output_failure = False
     if result.get("run_status") != "complete":
-        message = "存在待复核评分格，已暂停正式PNG和Excel输出" if result.get("run_status") == "pending_review" else "任务证据不完整，已暂停PNG和Excel输出"
+        if result.get("run_status") == "pending_review":
+            message = "存在待复核评分格，已暂停正式PNG和Excel输出"
+        elif result.get("run_status") == "awaiting_standard_decision":
+            message = "标准答案存在异常空值，已在评分前暂停正式PNG和Excel输出并保留证据"
+        else:
+            message = "任务证据不完整，已暂停PNG和Excel输出"
         return None, None, [message], False
     stem = safe_filename(f"{result['metadata']['group']}_{result['metadata']['progress']}_准确率")
     if png_mode == "on":
@@ -1521,6 +1841,8 @@ def build_scored_result(
     failed_documents: list[dict[str, Any]] | None = None,
     ocr_confidence_threshold: float = 0.75,
     ocr_stats: dict[str, Any] | None = None,
+    standard_blank_action: str | None = None,
+    standard_blank_decision_key_value: str | None = None,
 ) -> dict[str, Any]:
     config = load_config()
     profile = config["profiles"].get(profile_key)
@@ -1534,10 +1856,98 @@ def build_scored_result(
         raise AssessmentError(f"考试 {profile['display_name']} 的作业必须来自 {allowed_source} 证据")
 
     standard = parse_standard(standard_documents, dimensions, config)
+    blank_issues = unexpected_standard_blanks(standard, dimensions, config)
+    current_decision_key = standard_blank_decision_key(
+        standard,
+        dimensions,
+        blank_issues,
+        standard_documents,
+    ) if blank_issues else ""
+    decision_approved = bool(
+        blank_issues
+        and standard_blank_action == "exclude"
+        and standard_blank_decision_key_value == current_decision_key
+    )
+    failures = list(failed_documents or [])
+    if blank_issues and not decision_approved:
+        preflight_review_items = ocr_review_items_before_scoring(
+            standard,
+            homework_documents,
+            dimensions,
+            config,
+            aliases,
+            ocr_confidence_threshold,
+        )
+        decision_request = standard_blank_decision_request(
+            blank_issues,
+            current_decision_key,
+            standard_blank_action,
+            standard_blank_decision_key_value,
+        )
+        fingerprint = scoring_fingerprint(
+            standard,
+            dimensions,
+            profile,
+            aliases,
+            ocr_confidence_threshold,
+            "awaiting_decision",
+            current_decision_key,
+        )
+        result = {
+            "schema_version": 4,
+            "run_status": "awaiting_standard_decision",
+            "metadata": {
+                "exam_profile": profile_key,
+                "exam_name": profile["display_name"],
+                "source_mode": source_mode,
+                "group": group,
+                "progress": progress,
+                "dimensions": dimensions,
+                "color_scale": COLORS,
+                "ocr_confidence_threshold": ocr_confidence_threshold,
+                **({"ocr": ocr_stats} if ocr_stats else {}),
+                **fingerprint,
+            },
+            "summary": [],
+            "details": [],
+            "anomalies": [
+                {
+                    "student": "",
+                    "type": "标准答案异常空值",
+                    "dimension": item["dimension"],
+                    "id": item["id"],
+                    "detail": "非特殊维度标准答案为空，尚未执行任何准确率计算",
+                }
+                for item in blank_issues
+            ] + [
+                {
+                    "student": item.get("student", ""),
+                    "type": "OCR待复核",
+                    "dimension": item.get("dimension", ""),
+                    "id": item.get("id", ""),
+                    "detail": item.get("reason", ""),
+                }
+                for item in preflight_review_items
+            ],
+            "group_summary": {"correct": 0, "total": 0, "accuracy": None},
+            "evidence": evidence_index(standard_documents + homework_documents),
+            "standard_answer_evidence": standard_answer_evidence(standard, dimensions),
+            "failed_documents": failures,
+            "cache_stats": {"scores": {"hits": 0, "misses": 0}},
+            "output_warnings": [],
+            "decision_request": decision_request,
+            "preflight_review_items": preflight_review_items,
+        }
+        result["stopped_items"] = stopped_items_for(result)
+        validate_result_schema(result)
+        return result
+
     if homework_documents:
         students, initial_anomalies = parse_homework_documents(homework_documents, dimensions, config, aliases)
     else:
         students, initial_anomalies = OrderedDict(), []
+    excluded_blank_cells = {(item["dimension"], item["id"]) for item in blank_issues} if decision_approved else set()
+    standard_blank_policy = "exclude" if decision_approved else "none"
     scored, score_cache_stats, fingerprint = score_students_incremental(
         standard,
         students,
@@ -1547,14 +1957,24 @@ def build_scored_result(
         aliases,
         score_cache_dir,
         ocr_confidence_threshold,
+        excluded_blank_cells,
+        standard_blank_policy,
+        current_decision_key if decision_approved else "",
     )
-    failures = list(failed_documents or [])
     if not students and not failures:
         failures.append({"role": "homework", "student": "", "error": "没有发现任何有效学员作业"})
+    if students and scored["group_summary"]["total"] == 0 and not failures:
+        failures.append({
+            "stage": "scoring",
+            "role": "standard",
+            "student": "",
+            "error": "所有维度均无有效评分格，无法计算任何准确率；请审核标准答案",
+            "next_action": "补全或修订标准答案后，复用同一Manifest和task_id续跑",
+        })
     pending_review = any(item.get("status") == "待复核" for item in scored["summary"])
     run_status = "incomplete" if failures else ("pending_review" if pending_review else "complete")
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_status": run_status,
         "metadata": {
             "exam_profile": profile_key,
@@ -1574,6 +1994,13 @@ def build_scored_result(
         "failed_documents": failures,
         "cache_stats": {"scores": score_cache_stats},
         "output_warnings": [],
+        **({
+            "standard_blank_decision": {
+                "action": "exclude",
+                "decision_key": current_decision_key,
+                "affected_cells": blank_issues,
+            }
+        } if decision_approved else {}),
     }
     result["stopped_items"] = stopped_items_for(result)
     if len(result["summary"]) != len(students):
@@ -1693,6 +2120,8 @@ def run_image_manifest(
         score_cache_dir=cache_root(manifest) / "scores",
         ocr_confidence_threshold=float(runtime["ocr_confidence_threshold"]),
         ocr_stats=ocr_stats or None,
+        standard_blank_action=args.standard_blank_action,
+        standard_blank_decision_key_value=args.standard_blank_decision_key,
     )
     png_mode, xlsx_mode = normalize_output_settings(args, manifest)
     return deliver_result(result, output_directory(args, manifest), png_mode, xlsx_mode)
@@ -1711,7 +2140,7 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
     failures = manifest_failures(manifest)
     if standard_path is None:
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "run_status": "incomplete",
             "metadata": {
                 "exam_profile": manifest["exam_profile"],
@@ -1726,6 +2155,7 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
             "summary": [],
             "details": [],
             "anomalies": [],
+            "group_summary": {"correct": 0, "total": 0, "accuracy": None},
             "evidence": [],
             "standard_answer_evidence": [],
             "failed_documents": failures or [{"role": "standard", "student": "", "error": "标准答案等待读取"}],
@@ -1751,6 +2181,8 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
         score_cache_dir=cache_root(manifest) / "scores",
         failed_documents=failures,
         ocr_confidence_threshold=float(manifest["runtime"]["ocr_confidence_threshold"]),
+        standard_blank_action=args.standard_blank_action,
+        standard_blank_decision_key_value=args.standard_blank_decision_key,
     )
     state = load_state(manifest)
     result["cache_stats"]["evidence"] = {
@@ -1826,6 +2258,8 @@ def run_direct(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict
         source_mode=profile["source_mode"],
         ocr_confidence_threshold=float(args.ocr_confidence_threshold),
         ocr_stats=ocr_stats or None,
+        standard_blank_action=args.standard_blank_action,
+        standard_blank_decision_key_value=args.standard_blank_decision_key,
     )
     png_mode, xlsx_mode = normalize_output_settings(args)
     return deliver_result(result, output_directory(args), png_mode, xlsx_mode)
@@ -1875,13 +2309,22 @@ def summary_text(result: dict[str, Any]) -> str:
     dimensions = result["metadata"].get("dimensions", [])
     for item in result.get("summary", []):
         if len(dimensions) == 1:
-            rate = item["dimensions"][dimensions[0]].get("accuracy")
+            dimension_summary = item["dimensions"][dimensions[0]]
+            rate = dimension_summary.get("accuracy")
+            status = dimension_summary.get("status", "")
         else:
             rate = item.get("overall_accuracy")
-        lines.append(f"{item['student']}：{percent_text(rate, 2)}")
+            status = item.get("status", "")
+        lines.append(f"{item['student']}：{accuracy_text(rate, status, 2)}")
     for stopped in result.get("stopped_items", []):
         target = "/".join(value for value in (stopped.get("student"), stopped.get("dimension"), stopped.get("id")) if value) or stopped.get("role") or stopped.get("stage")
         lines.append(f"未继续：{target}：{stopped.get('reason', '')}；下一步：{stopped.get('next_action', '')}")
+    request = result.get("decision_request")
+    if isinstance(request, dict):
+        lines.append(str(request.get("question") or "请选择下一步"))
+        for option in request.get("options", []):
+            lines.append(f"- {option.get('label', option.get('id', ''))}：{option.get('description', '')}")
+        lines.append(f"decision_key：{request.get('decision_key', '')}")
     return "\n".join(lines)
 
 
@@ -1915,6 +2358,7 @@ def main(argv: list[str] | None = None) -> int:
                 "anomalies": len(result["anomalies"]),
                 "warnings": result.get("output_warnings", []),
                 "stopped_items": result.get("stopped_items", []),
+                "decision_request": result.get("decision_request"),
             },
             ensure_ascii=False,
         )
@@ -1925,6 +2369,8 @@ def main(argv: list[str] | None = None) -> int:
         return 5
     if result.get("run_status") == "incomplete":
         return 4
+    if result.get("run_status") == "awaiting_standard_decision":
+        return 6
     if result.get("_hard_output_failure"):
         return 3
     return 0

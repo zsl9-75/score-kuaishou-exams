@@ -103,7 +103,7 @@ python3 scripts/run_assessment.py \
 
 ## 输出模式
 
-默认保存 schema v3 评分JSON，之后才选择渲染：
+默认保存 schema v4 评分JSON，之后才选择渲染：
 
 ```bash
 # 只评分并输出文字摘要，强制不生成PNG/Excel
@@ -116,6 +116,15 @@ python3 scripts/run_assessment.py --manifest /path/to/task.json --output /absolu
 python3 scripts/run_assessment.py --result-json /path/to/result.json --output /absolute/delivery --png on --xlsx on
 ```
 
+非特殊维度出现标准空值时，第一次运行返回 `awaiting_standard_decision`、退出码6和 `decision_request`，不得继续评分。必须一次列出全部空值并问用户选择“审核标准答案”或“继续计算准确率”。用户明确选择继续后，使用原命令加上：
+
+```bash
+--standard-blank-action exclude \
+--standard-blank-decision-key "暂停JSON中的decision_key"
+```
+
+决策键绑定完整标准答案内容和异常空值位置；标准答案发生任何变化时旧键自动失效。用户选择审核时等待其修订，之后复用同一Manifest和 `task_id`，不要重读未变化的学员证据。
+
 - `--png on|off` 默认 `off`。
 - `--xlsx auto|on|off` 默认 `off`。`auto` 在 openpyxl 不可用时只警告；`on` 输出失败时回滚本次所有正式PNG/XLSX，只保留说明原因的 `output_failed` JSON，退出码为3。
 - `--skip-xlsx` 暂时等价于 `--xlsx off`。CLI 覆盖 Manifest，Manifest 覆盖默认值。
@@ -127,7 +136,8 @@ python3 scripts/run_assessment.py --result-json /path/to/result.json --output /a
 
 每次运行都读取最终CLI JSON中的 `stopped_items`。只要列表非空，最终回复必须逐条告诉用户：停止阶段、学员/维度/ID、`reason` 和 `next_action`；不能只说“失败”“待复核”或“稍后继续”。
 
-- `pending_review`、`incomplete`、`output_failed` 绝不能表述为已完成。
+- `awaiting_standard_decision`、`pending_review`、`incomplete`、`output_failed` 绝不能表述为已完成。
+- `awaiting_standard_decision` 时必须逐项列出异常维度和ID，明确说明已保留读取数据，并原样提供“审核标准答案”和“继续计算准确率”两个选择；未经用户明确选择禁止自行排除。
 - CLI在输入、权限、证据结构或环境错误时，也会在stderr最后一行输出 `status=stopped` 和停止原因；最终回复必须转述。
 - 即使主任务有部分成功，也必须报告所有没有继续执行的分支及停止原因。
 - 只有 `run_status=complete` 且没有未说明的停止项时，才能交付正式成绩。
@@ -136,14 +146,15 @@ python3 scripts/run_assessment.py --result-json /path/to/result.json --output /a
 
 - 按规范化 ID 和表头匹配，禁止按物理行序或列序匹配。未声明维度、归因列和解释列不计分。
 - 以标准答案每个维度的 ID 集合为题目全集。缺失 ID 计错，额外 ID 只进入异常，重复 ID 中止该数据集。
-- `多镜头指令遵循`、`多镜头间一致连贯性` 允许标准空值：空/空正确，空/非空错误，非空/空错误。其他维度标准空值中止，作业空值计错。
+- `多镜头指令遵循`、`多镜头间一致连贯性` 允许标准空值：空/空正确，空/非空错误，非空/空错误，始终计入分母。
+- 其他维度标准空值在任何准确率计算前触发决策门禁。用户选择继续后只排除对应评分格，不判对错且不进入维度、个人或全组分母；整维全部排除时显示“未评分”。若所有维度都无有效格则停止正式交付并要求审核标准答案。
 - 标准答案原始单元格是唯一依据，不限制为预设值，不改写、补字或替换。一个单元格可包含一个或多个关键词，多标签/数组或换行、逗号、顿号、斜杠、竖线都可分隔。重复关键词去重；结构化空值不得与非空关键词混合。
 - 作业答案不做规范值转换。仅在匹配副本中去除空白，按区分大小写的双向包含判定：作业包含标准关键词，或标准关键词包含作业。命中任意关键词即正确，该 ID/维度始终只计一道题。
-- 多维综合准确率是规定维度的等权平均，`整体` 也正常参与平均。
+- 个人总准确率和全组准确率均按“正确有效格数 ÷ 有效评分格总数”计算；被排除格完全不参与，`整体`仍是普通评分维度。
 
 ## 输出验收
 
-- JSON schema v3 包含完整汇总、逐题明细、异常、证据索引、失败文档、`run_id`、`stopped_items`、缓存命中与评分规则版本；`--result-json` 重渲染前会复核人数、分数、准确率、错题、复核题、明细和证据来源的一致性。
+- JSON schema v4 包含完整汇总、逐题明细、异常、证据索引、失败文档、`group_summary`、`run_id`、`stopped_items`、缓存命中与评分规则版本。排除格记录为“不计分”，维度同时记录原始题数 `source_total`、有效分母 `total` 和 `excluded_ids`；旧schema仍可读取。
 - Excel 使用 openpyxl，包含 `成绩汇总`、`逐题明细`、`异常复核`、`证据索引` 四个工作表；准确率是数值，使用 Excel 原生条件格式。
-- 单维 PNG 按准确率降序显示同学、答对数、准确率和错误 ID；多维 PNG 按配置顺序显示各维度与等权平均。
+- 单维 PNG 按准确率降序显示同学、有效答对数、准确率及错误/排除ID；多维 PNG 按配置顺序显示各维度与有效格汇总总准确率。
 - 色阶固定：90–100% `#6AB37B`，80–89% `#A7D08D`，70–79% `#FEE07B`，60–69% `#F5A05C`，低于60% `#F35161`。

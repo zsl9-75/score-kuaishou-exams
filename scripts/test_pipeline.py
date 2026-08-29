@@ -186,9 +186,172 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(list(parsed), dimensions, profile_key)
             self.assertTrue(all(list(values) == ["46"] for values in parsed.values()), profile_key)
 
-    def test_non_special_standard_blank_is_fatal(self):
-        with self.assertRaisesRegex(pipeline.AssessmentError, "不允许标准空值"):
-            pipeline.parse_standard([document(["ID", "画面美学"], [[46, ""]])], ["画面美学"], self.config)
+    def test_non_special_standard_blank_requires_decision_before_scoring(self):
+        standard_docs = [document(["ID", "画面美学", "动态美学"], [[1, "", ""], [2, "都一般", "一样好"]])]
+        homework_docs = [document(["同学名称", "ID", "画面美学", "动态美学"], [["张三", 1, "任意内容", "一样好"], ["张三", 2, "都一般", "一样好"]])]
+        result = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual",
+            group="29组",
+            progress="异常标准空值",
+            standard_documents=standard_docs,
+            homework_documents=homework_docs,
+            aliases={},
+            source_mode="docs",
+        )
+        self.assertEqual(result["schema_version"], 4)
+        self.assertEqual(result["run_status"], "awaiting_standard_decision")
+        self.assertEqual(result["summary"], [])
+        self.assertEqual(result["details"], [])
+        self.assertEqual(len(result["evidence"]), 2)
+        self.assertEqual(
+            {(item["dimension"], item["id"]) for item in result["decision_request"]["affected_cells"]},
+            {("画面美学", "1"), ("动态美学", "1")},
+        )
+        self.assertTrue(result["decision_request"]["data_retained"])
+        self.assertTrue(all(item["stage"] == "standard_answer_review" for item in result["stopped_items"]))
+
+    def test_standard_blank_decision_excludes_cells_and_uses_effective_denominator(self):
+        standard_docs = [document(["ID", "画面美学", "动态美学"], [[1, "", "一样好"], [2, "都一般", "一样好"]])]
+        homework_docs = [document(["同学名称", "ID", "画面美学", "动态美学"], [["张三", 1, "即使非空也排除", "一样好"], ["张三", 2, "都一般", "一样好"]])]
+        waiting = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="逐格排除",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs",
+        )
+        key = waiting["decision_request"]["decision_key"]
+        result = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="逐格排除",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value=key,
+        )
+        self.assertEqual(result["run_status"], "complete")
+        summary = result["summary"][0]
+        aesthetic = summary["dimensions"]["画面美学"]
+        self.assertEqual((aesthetic["source_total"], aesthetic["total"], aesthetic["correct"]), (2, 1, 1))
+        self.assertEqual(aesthetic["excluded_ids"], ["1"])
+        self.assertEqual((summary["overall_correct"], summary["overall_total"], summary["overall_accuracy"]), (3, 3, 1.0))
+        self.assertEqual(result["group_summary"], {"correct": 3, "total": 3, "accuracy": 1.0})
+        excluded = [item for item in result["details"] if item["result"] == "不计分"]
+        self.assertEqual([(item["dimension"], item["id"]) for item in excluded], [("画面美学", "1")])
+        self.assertEqual(result["standard_blank_decision"]["decision_key"], key)
+        tampered = json.loads(json.dumps(result, ensure_ascii=False))
+        tampered.pop("standard_blank_decision")
+        with self.assertRaisesRegex(pipeline.AssessmentError, "standard_blank_decision"):
+            pipeline.validate_result_schema(tampered)
+
+        stale = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="逐格排除",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value="stale-key",
+        )
+        self.assertEqual(stale["run_status"], "awaiting_standard_decision")
+        self.assertFalse(stale["decision_request"]["provided_key_valid"])
+        self.assertTrue(any("decision_key" in item["reason"] for item in stale["stopped_items"]))
+        changed_standard = [document(["ID", "画面美学", "动态美学"], [[1, "都一般", "一样好"], [2, "", "一样好"]])]
+        changed = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="逐格排除",
+            standard_documents=changed_standard, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value=key,
+        )
+        self.assertEqual(changed["run_status"], "awaiting_standard_decision")
+        self.assertNotEqual(changed["decision_request"]["decision_key"], key)
+
+        revision_changed_standard = [
+            document(
+                ["ID", "画面美学", "动态美学"],
+                [[1, "", "一样好"], [2, "都一般", "一样好"]],
+                revision="r2",
+            )
+        ]
+        revision_changed = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="逐格排除",
+            standard_documents=revision_changed_standard, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value=key,
+        )
+        self.assertEqual(revision_changed["run_status"], "awaiting_standard_decision")
+        self.assertNotEqual(revision_changed["decision_request"]["decision_key"], key)
+
+    def test_standard_blank_gate_reports_evidence_failures_at_the_same_time(self):
+        result = pipeline.build_scored_result(
+            profile_key="retake-image-aesthetic", group="29组", progress="空值与证据失败",
+            standard_documents=[document(["ID", "画面美学"], [[1, ""]])],
+            homework_documents=[document(["同学名称", "ID", "画面美学"], [["张三", 1, "任意"]])],
+            aliases={}, source_mode="docs",
+            failed_documents=[{"role": "homework", "student": "李四", "error": "无权访问"}],
+        )
+        self.assertEqual(result["run_status"], "awaiting_standard_decision")
+        self.assertEqual({item["stage"] for item in result["stopped_items"]}, {"standard_answer_review", "evidence"})
+        self.assertTrue(all(item["reason"] and item["next_action"] for item in result["stopped_items"]))
+
+    def test_standard_blank_gate_reports_ocr_review_and_evidence_failure_together(self):
+        standard_doc = document(["ID", "画面美学"], [[1, ""]], source="image_ocr")
+        standard_doc["confidence"] = {"1": 0.4}
+        standard_doc["confidence_issues"] = {}
+        homework_doc = document(
+            ["同学名称", "ID", "画面美学"],
+            [["张三", 1, "任意"]],
+            source="image_ocr",
+        )
+        homework_doc["confidence"] = {"1": 0.3}
+        homework_doc["confidence_issues"] = {}
+        result = pipeline.build_scored_result(
+            profile_key="retake-image-aesthetic", group="29组", progress="组合停止原因",
+            standard_documents=[standard_doc], homework_documents=[homework_doc],
+            aliases={}, source_mode="images", ocr_confidence_threshold=0.75,
+            failed_documents=[{"role": "homework", "student": "李四", "error": "无权访问"}],
+        )
+        self.assertEqual(result["run_status"], "awaiting_standard_decision")
+        self.assertEqual(result["details"], [])
+        self.assertEqual(
+            {item["stage"] for item in result["stopped_items"]},
+            {"standard_answer_review", "ocr_review", "evidence"},
+        )
+        ocr_stops = [item for item in result["stopped_items"] if item["stage"] == "ocr_review"]
+        self.assertEqual({item["role"] for item in ocr_stops}, {"standard", "homework"})
+        self.assertTrue(all(item["reason"] and item["next_action"] for item in ocr_stops))
+
+    def test_fully_excluded_dimension_is_unscored_but_other_dimensions_count(self):
+        standard_docs = [document(["ID", "画面美学", "动态美学"], [[1, "", "一样好"], [2, "", "一样好"]])]
+        homework_docs = [document(["同学名称", "ID", "画面美学", "动态美学"], [["张三", 1, "任意", "一样好"], ["张三", 2, "", "错误"]])]
+        waiting = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="整维未评分",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs",
+        )
+        result = pipeline.build_scored_result(
+            profile_key="online-aesthetics-dual", group="29组", progress="整维未评分",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value=waiting["decision_request"]["decision_key"],
+        )
+        summary = result["summary"][0]
+        self.assertEqual(summary["dimensions"]["画面美学"]["status"], "未评分")
+        self.assertIsNone(summary["dimensions"]["画面美学"]["accuracy"])
+        self.assertEqual((summary["overall_correct"], summary["overall_total"], summary["overall_accuracy"]), (1, 2, 0.5))
+        self.assertEqual(result["run_status"], "complete")
+
+    def test_all_cells_excluded_stops_formal_delivery(self):
+        standard_docs = [document(["ID", "画面美学"], [[1, ""], [2, ""]])]
+        homework_docs = [document(["同学名称", "ID", "画面美学"], [["张三", 1, "任意"], ["张三", 2, ""]])]
+        waiting = pipeline.build_scored_result(
+            profile_key="retake-image-aesthetic", group="29组", progress="无有效格",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs",
+        )
+        result = pipeline.build_scored_result(
+            profile_key="retake-image-aesthetic", group="29组", progress="无有效格",
+            standard_documents=standard_docs, homework_documents=homework_docs,
+            aliases={}, source_mode="docs", standard_blank_action="exclude",
+            standard_blank_decision_key_value=waiting["decision_request"]["decision_key"],
+        )
+        self.assertEqual(result["run_status"], "incomplete")
+        self.assertEqual(result["summary"][0]["status"], "未评分")
+        self.assertEqual(result["group_summary"], {"correct": 0, "total": 0, "accuracy": None})
+        self.assertIn("所有维度均无有效评分格", result["failed_documents"][0]["error"])
 
     def test_special_blank_matrix(self):
         dimensions = ["多镜头指令遵循", "多镜头间一致连贯性"]
@@ -203,6 +366,7 @@ class PipelineTests(unittest.TestCase):
             )
         ]
         standard = pipeline.parse_standard(standard_docs, dimensions, self.config)
+        self.assertEqual(pipeline.unexpected_standard_blanks(standard, dimensions, self.config), [])
         students, anomalies = pipeline.parse_homework_documents(homework_docs, dimensions, self.config, {})
         result = pipeline.score_students(standard, students, dimensions, anomalies)
         first, second = [result["summary"][0]["dimensions"][dim] for dim in dimensions]
@@ -405,6 +569,93 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(cli_payload["status"], "pending_review")
             self.assertTrue(cli_payload["stopped_items"][0]["reason"])
 
+    def test_standard_blank_gate_cli_exits_six_and_never_emits_formal_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            standard_path = temp / "standard.json"
+            homework_path = temp / "homework.json"
+            write_json(standard_path, document(["ID", "画面美学"], [[1, ""], [2, "都一般"]]))
+            write_json(homework_path, document(["同学名称", "ID", "画面美学"], [["张三", 1, "非空"], ["张三", 2, "都一般"]]))
+            completed = subprocess.run(
+                [
+                    sys.executable, str(MODULE_PATH),
+                    "--exam-profile", "retake-image-aesthetic", "--group", "29组", "--progress", "标准空值门禁",
+                    "--standard-evidence", str(standard_path), "--homework-evidence", str(homework_path),
+                    "--output", str(temp / "delivery"), "--png", "on", "--xlsx", "on",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 6, completed.stderr)
+            payload = json.loads(completed.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "awaiting_standard_decision")
+            self.assertIsNone(payload["xlsx"])
+            self.assertIsNone(payload["png"])
+            self.assertTrue(payload["decision_request"]["decision_key"])
+            self.assertEqual(payload["decision_request"]["affected_cells"][0]["dimension"], "画面美学")
+            saved = json.loads(Path(payload["json"]).read_text(encoding="utf-8"))
+            self.assertEqual(saved["summary"], [])
+            self.assertEqual(len(saved["evidence"]), 2)
+            self.assertTrue(saved["decision_request"]["data_retained"])
+            self.assertFalse(list((temp / "delivery").rglob("*.xlsx")))
+            self.assertFalse(list((temp / "delivery").rglob("*.png")))
+            rerender = subprocess.run(
+                [
+                    sys.executable, str(MODULE_PATH), "--result-json", payload["json"],
+                    "--output", str(temp / "rerender"), "--png", "on", "--xlsx", "on",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(rerender.returncode, 6, rerender.stderr)
+            rerender_payload = json.loads(rerender.stdout.strip().splitlines()[-1])
+            self.assertIsNone(rerender_payload["xlsx"])
+            self.assertIsNone(rerender_payload["png"])
+            continued = subprocess.run(
+                [
+                    sys.executable, str(MODULE_PATH),
+                    "--exam-profile", "retake-image-aesthetic", "--group", "29组", "--progress", "标准空值门禁",
+                    "--standard-evidence", str(standard_path), "--homework-evidence", str(homework_path),
+                    "--standard-blank-action", "exclude",
+                    "--standard-blank-decision-key", payload["decision_request"]["decision_key"],
+                    "--output", str(temp / "continued"), "--png", "on", "--xlsx", "on",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(continued.returncode, 0, continued.stderr)
+            continued_payload = json.loads(continued.stdout.strip().splitlines()[-1])
+            self.assertEqual(continued_payload["status"], "complete")
+            self.assertTrue(Path(continued_payload["xlsx"]).exists())
+            self.assertTrue(Path(continued_payload["png"]).exists())
+
+    def test_unscored_dimension_renders_as_unscored_in_excel_and_png(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            standard_docs = [document(["ID", "画面美学", "动态美学"], [[1, "", "一样好"], [2, "", "一样好"]])]
+            homework_docs = [document(["同学名称", "ID", "画面美学", "动态美学"], [["张三", 1, "任意", "一样好"], ["张三", 2, "", "错误"]])]
+            waiting = pipeline.build_scored_result(
+                profile_key="online-aesthetics-dual", group="29组", progress="未评分报表",
+                standard_documents=standard_docs, homework_documents=homework_docs,
+                aliases={}, source_mode="docs",
+            )
+            result = pipeline.build_scored_result(
+                profile_key="online-aesthetics-dual", group="29组", progress="未评分报表",
+                standard_documents=standard_docs, homework_documents=homework_docs,
+                aliases={}, source_mode="docs", standard_blank_action="exclude",
+                standard_blank_decision_key_value=waiting["decision_request"]["decision_key"],
+            )
+            xlsx, png, _, _, _ = pipeline.deliver_result(result, Path(temp_name) / "delivery", "on", "on")
+            self.assertTrue(xlsx and xlsx.exists())
+            self.assertTrue(png and png.exists())
+            workbook = load_workbook(xlsx, data_only=False)
+            values = [cell.value for cell in workbook["成绩汇总"][2]]
+            workbook.close()
+            self.assertEqual(values[3], "未评分")
+            self.assertEqual(values[-1], 0.5)
+
     def test_standard_and_missing_or_misaligned_homework_confidence_require_review(self):
         with tempfile.TemporaryDirectory() as temp_name:
             temp = Path(temp_name)
@@ -462,6 +713,39 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(low["summary"][0]["status"], "待复核")
             self.assertEqual(high_stats["misses"], 1)
             self.assertEqual(low_stats["misses"], 1)
+
+    def test_score_cache_key_includes_standard_blank_policy_and_decision_key(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            dimensions = ["画面美学"]
+            standard = pipeline.parse_standard(
+                [document(["ID", "画面美学"], [[1, ""], [2, "都一般"]])],
+                dimensions,
+                self.config,
+            )
+            students, anomalies = pipeline.parse_homework_documents(
+                [document(["ID", "画面美学"], [[1, "非空"], [2, "都一般"]], student_name="王五")],
+                dimensions,
+                self.config,
+                {},
+            )
+            profile = self.config["profiles"]["retake-image-aesthetic"]
+            first, first_stats, _ = pipeline.score_students_incremental(
+                standard, students, dimensions, anomalies, profile, {}, Path(temp_name), 0.75,
+                {("画面美学", "1")}, "exclude", "decision-a",
+            )
+            second, second_stats, _ = pipeline.score_students_incremental(
+                standard, students, dimensions, anomalies, profile, {}, Path(temp_name), 0.75,
+                {("画面美学", "1")}, "exclude", "decision-a",
+            )
+            changed, changed_stats, _ = pipeline.score_students_incremental(
+                standard, students, dimensions, anomalies, profile, {}, Path(temp_name), 0.75,
+                {("画面美学", "1")}, "exclude", "decision-b",
+            )
+            self.assertEqual(first_stats, {"hits": 0, "misses": 1})
+            self.assertEqual(second_stats, {"hits": 1, "misses": 0})
+            self.assertEqual(changed_stats, {"hits": 0, "misses": 1})
+            self.assertEqual(first["summary"], second["summary"])
+            self.assertEqual(first["summary"], changed["summary"])
 
     def test_ocr_api_confidence_contract_is_strict_and_normalizes_ids(self):
         base = {"student_name": "王五", "headers": ["ID", "画面美学"], "rows": [["46.0", "都一般"]]}
@@ -951,6 +1235,38 @@ class PipelineTests(unittest.TestCase):
             _, _, changed_standard = pipeline.run(args)
             self.assertEqual(changed_standard["cache_stats"]["scores"], {"hits": 0, "misses": 2})
 
+    def test_manifest_standard_blank_review_keeps_homework_evidence_and_scores_only_after_fix(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            write_json(temp / "standard.json", document(["ID", "画面美学"], [[1, ""]], document_id="standard-doc", revision="std-r1"))
+            write_json(temp / "zhang.json", document(["ID", "画面美学"], [[1, "都一般"]], student_name="张三", document_id="student-zhang", revision="zhang-r1"))
+            write_json(temp / "li.json", document(["ID", "画面美学"], [[1, "都一般"]], student_name="李四", document_id="student-li", revision="li-r1"))
+            args = pipeline.parse_args(["--manifest", str(manifest_path), "--output", str(temp / "output")])
+
+            _, _, waiting = pipeline.run(args)
+            self.assertEqual(waiting["run_status"], "awaiting_standard_decision")
+            self.assertEqual(waiting["cache_stats"]["scores"], {"hits": 0, "misses": 0})
+            manifest = runtime.load_manifest(manifest_path)
+            before = {
+                item_id: (entry.get("content_sha256"), entry.get("cache_path"))
+                for item_id, entry in runtime.load_state(manifest)["documents"].items()
+                if entry.get("role") == "homework"
+            }
+            self.assertEqual(len(before), 2)
+
+            write_json(temp / "standard.json", document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard-doc", revision="std-r1"))
+            _, _, completed = pipeline.run(args)
+            self.assertEqual(completed["run_status"], "complete")
+            after = {
+                item_id: (entry.get("content_sha256"), entry.get("cache_path"))
+                for item_id, entry in runtime.load_state(manifest)["documents"].items()
+                if entry.get("role") == "homework"
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(completed["cache_stats"]["scores"], {"hits": 0, "misses": 2})
+
     def test_incomplete_manifest_pauses_outputs_and_resumes_only_missing_student(self):
         with tempfile.TemporaryDirectory() as temp_name:
             temp = Path(temp_name)
@@ -1194,17 +1510,23 @@ class PipelineTests(unittest.TestCase):
     def test_flat_layout_package_uses_skill_name_for_file_and_archive_root(self):
         with tempfile.TemporaryDirectory() as temp_name:
             flat = Path(temp_name)
-            project_root = Path(__file__).resolve().parent.parent
+            script_location = Path(__file__).resolve().parent
+            project_root = script_location.parent if (script_location.parent / "SKILL.md").is_file() else script_location
+            standard_layout = (project_root / "scripts" / "run_assessment.py").is_file()
+
+            def source(standard_name, flat_name):
+                return project_root / (standard_name if standard_layout else flat_name)
+
             shutil.copy2(project_root / "SKILL.md", flat / "SKILL.md")
             shutil.copy2(project_root / "requirements.txt", flat / "requirements.txt")
-            shutil.copy2(project_root / "agents" / "openai.yaml", flat / "openai.yaml")
+            shutil.copy2(source("agents/openai.yaml", "openai.yaml"), flat / "openai.yaml")
             for name in ("exam_profiles.json", "evidence-schema.md", "manifest.md"):
-                shutil.copy2(project_root / "references" / name, flat / name)
+                shutil.copy2(source(f"references/{name}", name), flat / name)
             for name in (
                 "run_assessment.py", "manifest_runtime.py", "build_workbook.py", "ocr_api.py",
                 "ocr_vision.swift", "package_skill.py", "test_pipeline.py",
             ):
-                shutil.copy2(project_root / "scripts" / name, flat / name)
+                shutil.copy2(source(f"scripts/{name}", name), flat / name)
             completed = subprocess.run(
                 [sys.executable, str(flat / "package_skill.py")],
                 capture_output=True,

@@ -91,6 +91,12 @@ def add_score_rules(ws, cell_range: str) -> None:
         )
 
 
+def accuracy_cell(rate: Any, status: str) -> Any:
+    if rate is not None:
+        return rate
+    return "未评分" if status == "未评分" else "待复核"
+
+
 def build_summary(ws, data: dict[str, Any]) -> None:
     dimensions = list(data["metadata"]["dimensions"])
     summaries = list(data.get("summary", []))
@@ -106,15 +112,15 @@ def build_summary(ws, data: dict[str, Any]) -> None:
         append_safe(ws, ["组别", "进度", "同学", "答对数", f"{dimension}准确率", "错误 ID"])
         for summary in summaries:
             dim = summary["dimensions"][dimension]
-            wrong = list(dim.get("wrong_ids", [])) + [f"{item}*" for item in dim.get("review_ids", [])]
+            wrong = list(dim.get("wrong_ids", [])) + [f"{item}*" for item in dim.get("review_ids", [])] + [f"{item}(排除)" for item in dim.get("excluded_ids", [])]
             append_safe(
                 ws,
                 [
                     data["metadata"]["group"],
                     data["metadata"]["progress"],
                     summary["student"],
-                    f"{dim['correct']}/{dim['total']}" if dim.get("accuracy") is not None else "待复核",
-                    dim.get("accuracy") if dim.get("accuracy") is not None else "待复核",
+                    "未评分" if dim.get("status") == "未评分" else (f"{dim['correct']}/{dim['total']}" if dim.get("accuracy") is not None else "待复核"),
+                    accuracy_cell(dim.get("accuracy"), dim.get("status", "")),
                     ", ".join(wrong) or "—",
                 ]
             )
@@ -123,7 +129,7 @@ def build_summary(ws, data: dict[str, Any]) -> None:
             add_score_rules(ws, f"E2:E{ws.max_row}")
         return
 
-    append_safe(ws, ["组别", "进度", "姓名", *dimensions, f"{len(dimensions)}维度平均准确率"])
+    append_safe(ws, ["组别", "进度", "姓名", *dimensions, "总准确率（有效格汇总）"])
     for summary in summaries:
         append_safe(
             ws,
@@ -132,12 +138,13 @@ def build_summary(ws, data: dict[str, Any]) -> None:
                 data["metadata"]["progress"],
                 summary["student"],
                 *[
-                    summary["dimensions"][dimension].get("accuracy")
-                    if summary["dimensions"][dimension].get("accuracy") is not None
-                    else "待复核"
+                    accuracy_cell(
+                        summary["dimensions"][dimension].get("accuracy"),
+                        summary["dimensions"][dimension].get("status", ""),
+                    )
                     for dimension in dimensions
                 ],
-                summary.get("overall_accuracy") if summary.get("overall_accuracy") is not None else "待复核",
+                accuracy_cell(summary.get("overall_accuracy"), summary.get("status", "")),
             ]
         )
     first_score = 4
