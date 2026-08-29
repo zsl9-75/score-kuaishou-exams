@@ -7,6 +7,8 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 
 使用 Manifest 编排 Docs 读取，使用脚本执行缓存、匹配、评分和输出。不要临时重写评分规则。
 
+优先使用 `scripts/run_assessment.py` 与 `scripts/manifest_runtime.py`。若目标平台把Skill平铺且没有 `scripts/`，使用Skill根目录下同名脚本；脚本会自动从根目录寻找配置和OCR资源。不要自行猜测其他路径。
+
 ## 入口分流
 
 1. 用户只要从已有正式JSON生成Excel或PNG时，直接执行 `--result-json`；不访问Docs，不重新评分。
@@ -95,11 +97,13 @@ python3 scripts/run_assessment.py \
   --png on --xlsx on
 ```
 
-要比较Mac Vision与API耗时，在同一台Mac、同一批图片上分别执行 `--ocr-engine vision` 和 `--ocr-engine api`。结果JSON的 `metadata.ocr.standard/homework.elapsed_seconds` 与 `per_image_seconds` 是实测值；API耗时受模型、网络、限流、图片大小和并发数影响，不写死固定倍率。低于 `--ocr-confidence-threshold`（默认0.75）的答案进入“待复核”，不静默计对或计错。
+要比较Mac Vision与API耗时，在同一台Mac、同一批图片上分别执行 `--ocr-engine vision` 和 `--ocr-engine api`。结果JSON的 `metadata.ocr.standard/homework.elapsed_seconds` 与 `per_image_seconds` 是实测值；API耗时受模型、网络、限流、图片大小和并发数影响，不写死固定倍率。
+
+截图标准答案和截图作业的每个有效ID都必须有0–1有限数值置信度。标准答案或作业出现低置信度、缺失、非法值、重复键或规范化后无法对齐时，相关评分格进入“待复核”；全局状态为 `pending_review`，退出码为5，禁止生成正式PNG和Excel。
 
 ## 输出模式
 
-默认只原子保存 `组别_进度_评分结果.json`（schema v2），之后才选择渲染：
+默认保存 schema v3 评分JSON，之后才选择渲染：
 
 ```bash
 # 只评分并输出文字摘要，强制不生成PNG/Excel
@@ -113,11 +117,20 @@ python3 scripts/run_assessment.py --result-json /path/to/result.json --output /a
 ```
 
 - `--png on|off` 默认 `off`。
-- `--xlsx auto|on|off` 默认 `off`。`auto` 在 openpyxl 不可用时只警告；`on` 输出失败时保留 JSON 和其他成功文件，并以输出失败状态结束。
+- `--xlsx auto|on|off` 默认 `off`。`auto` 在 openpyxl 不可用时只警告；`on` 输出失败时回滚本次所有正式PNG/XLSX，只保留说明原因的 `output_failed` JSON，退出码为3。
 - `--skip-xlsx` 暂时等价于 `--xlsx off`。CLI 覆盖 Manifest，Manifest 覆盖默认值。
-- 评分 JSON 始终先保存。任一必需文档失败时，保存 `incomplete` JSON，暂停正式 PNG/Excel，退出码为 4；再次运行同一 Manifest 仅补读失败、未完成或 revision 变化的文档。
+- 每次运行使用独立 `run_id` 子目录并在临时目录生成，全部成功后原子发布；不同运行不共享同名正式文件。任一必需文档失败时保存 `incomplete` JSON，暂停正式PNG/Excel，退出码为4；再次运行同一Manifest仅补读失败、未完成或revision变化的文档。
 - `--output` 必须是绝对交付目录；Manifest 的 `output.dir` 只有写成绝对路径时才可替代。不要把产物写进Skill安装目录、缓存目录或临时目录。
 - 最终回复只使用CLI最后一行JSON里的 `json/xlsx/png` 绝对路径，并在回复前确认文件存在。不要手写、推测或返回输入证据目录。
+
+## 未继续项硬性回报
+
+每次运行都读取最终CLI JSON中的 `stopped_items`。只要列表非空，最终回复必须逐条告诉用户：停止阶段、学员/维度/ID、`reason` 和 `next_action`；不能只说“失败”“待复核”或“稍后继续”。
+
+- `pending_review`、`incomplete`、`output_failed` 绝不能表述为已完成。
+- CLI在输入、权限、证据结构或环境错误时，也会在stderr最后一行输出 `status=stopped` 和停止原因；最终回复必须转述。
+- 即使主任务有部分成功，也必须报告所有没有继续执行的分支及停止原因。
+- 只有 `run_status=complete` 且没有未说明的停止项时，才能交付正式成绩。
 
 ## 不可变评分规则
 
@@ -130,7 +143,7 @@ python3 scripts/run_assessment.py --result-json /path/to/result.json --output /a
 
 ## 输出验收
 
-- JSON schema v2 包含完整汇总、逐题明细、异常、证据索引、失败文档、缓存命中与评分规则版本。
+- JSON schema v3 包含完整汇总、逐题明细、异常、证据索引、失败文档、`run_id`、`stopped_items`、缓存命中与评分规则版本；`--result-json` 重渲染前会复核人数、分数、准确率、错题、复核题、明细和证据来源的一致性。
 - Excel 使用 openpyxl，包含 `成绩汇总`、`逐题明细`、`异常复核`、`证据索引` 四个工作表；准确率是数值，使用 Excel 原生条件格式。
 - 单维 PNG 按准确率降序显示同学、答对数、准确率和错误 ID；多维 PNG 按配置顺序显示各维度与等权平均。
 - 色阶固定：90–100% `#6AB37B`，80–89% `#A7D08D`，70–79% `#FEE07B`，60–69% `#F5A05C`，低于60% `#F35161`。

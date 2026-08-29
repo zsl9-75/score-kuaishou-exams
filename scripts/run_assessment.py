@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -32,14 +33,26 @@ from manifest_runtime import (
     resolve_path,
     scoring_documents,
     stable_hash,
+    validate_evidence_payload,
 )
 
 
-SKILL_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = SKILL_ROOT / "references" / "exam_profiles.json"
-VISION_SCRIPT = SKILL_ROOT / "scripts" / "ocr_vision.swift"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if (SCRIPT_DIR.parent / "references" / "exam_profiles.json").is_file():
+    SKILL_ROOT = SCRIPT_DIR.parent
+    CONFIG_PATH = SKILL_ROOT / "references" / "exam_profiles.json"
+    VISION_SCRIPT = SKILL_ROOT / "scripts" / "ocr_vision.swift"
+elif (SCRIPT_DIR / "exam_profiles.json").is_file():
+    # Defensive compatibility for platforms that flatten a Skill during import.
+    SKILL_ROOT = SCRIPT_DIR
+    CONFIG_PATH = SKILL_ROOT / "exam_profiles.json"
+    VISION_SCRIPT = SKILL_ROOT / "ocr_vision.swift"
+else:
+    SKILL_ROOT = SCRIPT_DIR.parent
+    CONFIG_PATH = SKILL_ROOT / "references" / "exam_profiles.json"
+    VISION_SCRIPT = SKILL_ROOT / "scripts" / "ocr_vision.swift"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
-SCORING_RULE_VERSION = "2026-08-27-evidence-and-ocr-v2"
+SCORING_RULE_VERSION = "2026-08-27-evidence-and-ocr-v3"
 STANDARD_ANSWER_DELIMITER = re.compile(r"[\r\n,，、/／|｜]+")
 STANDARD_COLLECTION_KEYS = ("values", "options", "labels", "items", "selected", "selections", "tags")
 STANDARD_SCALAR_KEYS = ("text", "label", "name", "title", "display_value", "displayValue", "value")
@@ -60,6 +73,11 @@ MAX_PNG_PIXELS = 80_000_000
 
 class AssessmentError(RuntimeError):
     pass
+
+
+class AssessmentArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise AssessmentError(f"命令参数错误：{message}")
 
 
 def compact_text(value: Any) -> str:
@@ -207,6 +225,48 @@ def load_aliases(path: Path | None) -> dict[str, str]:
     return {compact_text(k): compact_text(v) for k, v in data.items()}
 
 
+def normalize_image_confidence(document: dict[str, Any]) -> tuple[dict[str, float], dict[str, str]]:
+    """Normalize image confidence keys without allowing invalid values to disappear silently."""
+    if document.get("source") != "image_ocr":
+        return {}, {}
+    raw = document.get("confidence")
+    if not isinstance(raw, dict):
+        return {}, {"__document__": "截图证据缺少逐题 confidence 对象"}
+    normalized: dict[str, float] = {}
+    issues: dict[str, str] = {}
+    for raw_key, raw_value in raw.items():
+        row_id = normalize_id(raw_key)
+        if not row_id:
+            issues["__document__"] = "OCR置信度存在无法规范化的空ID键"
+            continue
+        if row_id in normalized or row_id in issues:
+            issues[row_id] = f"OCR置信度ID规范化后重复：{raw_key}"
+            normalized.pop(row_id, None)
+            continue
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            issues[row_id] = f"OCR置信度必须是0–1有限数值，实际为 {raw_value!r}"
+            continue
+        value = float(raw_value)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            issues[row_id] = f"OCR置信度必须在0–1之间，实际为 {raw_value!r}"
+            continue
+        normalized[row_id] = value
+    return normalized, issues
+
+
+def confidence_for_row(document: dict[str, Any], row_id: str) -> tuple[float | None, str]:
+    if document.get("source") != "image_ocr":
+        return None, ""
+    confidence = document.get("confidence") if isinstance(document.get("confidence"), dict) else {}
+    issues = document.get("confidence_issues") if isinstance(document.get("confidence_issues"), dict) else {}
+    if row_id in issues:
+        return None, str(issues[row_id])
+    if row_id not in confidence:
+        general = str(issues.get("__document__") or "")
+        return None, general or f"截图证据ID {row_id} 缺少逐题OCR置信度"
+    return float(confidence[row_id]), ""
+
+
 def flatten_documents(payload: Any, source_path: Path) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         raise AssessmentError(f"证据必须是 JSON 对象：{source_path}")
@@ -231,17 +291,23 @@ def flatten_documents(payload: Any, source_path: Path) -> list[dict[str, Any]]:
             raise AssessmentError(f"证据缺少 rows：{source_path} 第 {index} 项")
         normalized_rows: list[list[Any]] = []
         for row_number, row in enumerate(rows, start=2):
-            if isinstance(row, dict):
-                row = [row.get(str(header)) for header in headers]
             if not isinstance(row, list):
-                raise AssessmentError(f"证据第 {row_number} 行不是数组或对象：{source_path}")
+                raise AssessmentError(f"证据第 {row_number} 行必须是数组：{source_path}")
             if len(row) > len(headers):
                 raise AssessmentError(f"证据第 {row_number} 行列数超过表头：{source_path}")
             normalized_rows.append(row + [None] * (len(headers) - len(row)))
         clone = dict(doc)
         clone["headers"] = headers
         clone["rows"] = normalized_rows
+        confidence, confidence_issues = normalize_image_confidence(clone)
+        if clone.get("source") == "image_ocr":
+            clone["confidence"] = confidence
+            clone["confidence_issues"] = confidence_issues
         clone["_source_path"] = str(source_path)
+        try:
+            validate_evidence_payload(clone, source_path)
+        except ManifestError as exc:
+            raise AssessmentError(str(exc)) from exc
         result.append(clone)
     return result
 
@@ -318,6 +384,9 @@ def standard_answer_evidence(
                     "raw_cell": answer["raw_value"],
                     "keywords": list(keywords) if keywords else [],
                     "standard_blank": keywords is None,
+                    "source": answer.get("source", ""),
+                    "confidence": answer.get("confidence"),
+                    "confidence_issue": answer.get("confidence_issue", ""),
                 }
             )
     return entries
@@ -341,6 +410,7 @@ def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], confi
             if row_id in seen_ids:
                 raise AssessmentError(f"标准答案出现重复 ID：{row_id}")
             seen_ids.add(row_id)
+            confidence, confidence_issue = confidence_for_row(doc, row_id)
             for dimension, index in dim_indexes.items():
                 raw = row[index]
                 keywords = standard_answer_keywords(raw)
@@ -352,6 +422,9 @@ def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], confi
                     "raw_value": raw,
                     "keywords": keywords,
                     "row_number": row_number,
+                    "source": str(doc.get("source") or ""),
+                    "confidence": confidence,
+                    "confidence_issue": confidence_issue,
                 }
     if not seen_ids:
         raise AssessmentError("标准答案没有有效 ID")
@@ -406,13 +479,15 @@ def parse_homework_documents(
                     source_order=order_counter,
                 )
             student = students[name]
+            confidence, confidence_issue = confidence_for_row(doc, row_id)
             for dimension, index in dim_indexes.items():
                 if row_id in student.answers[dimension]:
                     raise AssessmentError(f"学员 {name} 的“{dimension}”出现重复 ID：{row_id}")
                 raw = row[index]
                 student.answers[dimension][row_id] = {
                     "raw": "" if raw is None else str(raw),
-                    "confidence": doc.get("confidence", {}).get(row_id) if isinstance(doc.get("confidence"), dict) else None,
+                    "confidence": confidence,
+                    "confidence_issue": confidence_issue,
                     "source_path": doc.get("_source_path", ""),
                 }
     if not students:
@@ -637,8 +712,7 @@ def ocr_documents(
             if name in seen_names:
                 raise AssessmentError(f"截图映射出重复学员：{name}")
             seen_names.add(name)
-        documents.append(
-            {
+        document = {
                 "schema_version": 1,
                 "source": "image_ocr",
                 **({"student_name": name} if role == "homework" else {}),
@@ -657,7 +731,10 @@ def ocr_documents(
                 },
                 "_source_path": str(path),
             }
-        )
+        normalized_confidence, confidence_issues = normalize_image_confidence(document)
+        document["confidence"] = normalized_confidence
+        document["confidence_issues"] = confidence_issues
+        documents.append(document)
     return documents, {
         "engine": selected_engine,
         "images": len(paths),
@@ -705,6 +782,24 @@ def score_students(
                 if actual is None:
                     reason = "缺失ID"
                     anomalies.append({"student": student.name, "type": "缺失ID", "dimension": dimension, "id": row_id, "detail": "按未答计错"})
+                elif expected.get("confidence_issue"):
+                    result = "待复核"
+                    reason = "标准答案OCR置信度无效：" + str(expected["confidence_issue"])
+                    review_ids.append(row_id)
+                    pending = True
+                    anomalies.append({"student": student.name, "type": "标准答案OCR置信度无效", "dimension": dimension, "id": row_id, "detail": reason})
+                elif expected.get("source") == "image_ocr" and expected.get("confidence") is not None and float(expected["confidence"]) < ocr_confidence_threshold:
+                    result = "待复核"
+                    reason = f"标准答案OCR置信度 {float(expected['confidence']):.3f} 低于阈值 {ocr_confidence_threshold:.3f}"
+                    review_ids.append(row_id)
+                    pending = True
+                    anomalies.append({"student": student.name, "type": "标准答案OCR低置信度", "dimension": dimension, "id": row_id, "detail": reason})
+                elif actual.get("confidence_issue"):
+                    result = "待复核"
+                    reason = "学员答案OCR置信度无效：" + str(actual["confidence_issue"])
+                    review_ids.append(row_id)
+                    pending = True
+                    anomalies.append({"student": student.name, "type": "学员答案OCR置信度无效", "dimension": dimension, "id": row_id, "detail": reason})
                 elif actual.get("confidence") is not None and float(actual["confidence"]) < ocr_confidence_threshold:
                     result = "待复核"
                     reason = f"OCR置信度 {float(actual['confidence']):.3f} 低于阈值 {ocr_confidence_threshold:.3f}"
@@ -746,6 +841,7 @@ def score_students(
                         "matched_keywords": "｜".join(matched_keywords),
                         "result": result,
                         "source": student.source_kind,
+                        "standard_confidence": "" if expected.get("confidence") is None else expected.get("confidence"),
                         "confidence": "" if actual is None or actual.get("confidence") is None else actual.get("confidence"),
                         "note": reason,
                     }
@@ -791,6 +887,9 @@ def scoring_fingerprint(
                 "id": row_id,
                 "raw": answer.get("raw_value"),
                 "keywords": list(answer.get("keywords") or []),
+                "source": answer.get("source"),
+                "confidence": answer.get("confidence"),
+                "confidence_issue": answer.get("confidence_issue"),
             }
             for row_id, answer in standard[dimension].items()
         ]
@@ -812,13 +911,14 @@ def student_fingerprint(student: StudentRecord, anomalies: list[dict[str, Any]])
                 "id": row_id,
                 "raw": answer.get("raw", ""),
                 "confidence": answer.get("confidence"),
+                "confidence_issue": answer.get("confidence_issue"),
             }
             for row_id, answer in rows.items()
         ]
         for dimension, rows in student.answers.items()
     }
     relevant_anomalies = [item for item in anomalies if item.get("student") in {"", student.name}]
-    return stable_hash({"student": student.name, "answers": answers, "anomalies": relevant_anomalies})
+    return stable_hash({"student": student.name, "source": student.source_kind, "answers": answers, "anomalies": relevant_anomalies})
 
 
 def score_students_incremental(
@@ -1056,7 +1156,7 @@ def build_workbook(result: dict[str, Any], output_path: Path) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="按固定考试配置核对快手考试准确率")
+    parser = AssessmentArgumentParser(description="按固定考试配置核对快手考试准确率")
     parser.add_argument("--manifest", type=Path, help="Manifest JSON；推荐的可续跑入口")
     parser.add_argument("--result-json", type=Path, help="直接从已有评分JSON生成PNG或Excel")
     parser.add_argument("--exam-profile", help="exam_profiles.json 中的考试配置键")
@@ -1126,17 +1226,77 @@ def ensure_output_directory(path: Path) -> Path:
     return path
 
 
+def stopped_items_for(result: dict[str, Any], warnings: list[str] | None = None) -> list[dict[str, str]]:
+    """Describe every branch that did not continue to a formal deliverable."""
+    stopped: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        normalized = {
+            "stage": str(item.get("stage") or "unknown"),
+            "role": str(item.get("role") or ""),
+            "student": str(item.get("student") or ""),
+            "dimension": str(item.get("dimension") or ""),
+            "id": str(item.get("id") or ""),
+            "reason": str(item.get("reason") or "未提供停止原因"),
+            "next_action": str(item.get("next_action") or "修复原因后重新运行或从同一 task_id 续跑"),
+        }
+        key = (normalized["stage"], normalized["student"], normalized["dimension"], normalized["id"], normalized["reason"])
+        if key not in seen:
+            seen.add(key)
+            stopped.append(normalized)
+
+    for failed in result.get("failed_documents", []):
+        add({
+            "stage": "evidence",
+            "role": failed.get("role", ""),
+            "student": failed.get("student", ""),
+            "reason": failed.get("error") or "证据未就绪",
+            "next_action": "修复权限、链接、结构或读取失败后，复用同一 task_id 继续运行",
+        })
+    for detail in result.get("details", []):
+        if detail.get("result") == "待复核":
+            add({
+                "stage": "ocr_review",
+                "role": "homework",
+                "student": detail.get("student", ""),
+                "dimension": detail.get("dimension", ""),
+                "id": detail.get("id", ""),
+                "reason": detail.get("note") or "OCR结果需要人工复核",
+                "next_action": "人工核对该评分格，或提供更清晰截图后重新OCR",
+            })
+    for warning in warnings or []:
+        if warning.startswith(("任务证据不完整", "存在待复核")):
+            continue
+        add({
+            "stage": "output",
+            "role": "report",
+            "reason": warning,
+            "next_action": "修复输出依赖或目录问题后，从正式评分JSON重新生成产物",
+        })
+    return stopped
+
+
+def _finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
 def validate_result_schema(result: Any) -> dict[str, Any]:
-    if not isinstance(result, dict) or result.get("schema_version") not in {1, 2}:
-        raise AssessmentError("评分JSON必须是 schema_version=1或2 的对象")
-    if result.get("run_status", "complete") not in {"complete", "incomplete"}:
-        raise AssessmentError("评分JSON run_status 必须是 complete 或 incomplete")
+    if not isinstance(result, dict) or result.get("schema_version") not in {1, 2, 3}:
+        raise AssessmentError("评分JSON必须是 schema_version=1、2或3 的对象")
+    if "run_status" not in result:
+        raise AssessmentError("评分JSON缺少 run_status，禁止默认视为 complete")
+    run_status = result.get("run_status")
+    if run_status not in {"complete", "incomplete", "pending_review", "output_failed"}:
+        raise AssessmentError("评分JSON run_status 必须是 complete、incomplete、pending_review 或 output_failed")
     metadata = result.get("metadata")
     if not isinstance(metadata, dict):
         raise AssessmentError("评分JSON缺少 metadata 对象")
-    for key in ("group", "progress", "dimensions"):
+    for key in ("exam_profile", "source_mode", "group", "progress", "dimensions"):
         if key not in metadata:
             raise AssessmentError(f"评分JSON metadata 缺少 {key}")
+    if metadata["source_mode"] not in {"docs", "images"}:
+        raise AssessmentError("评分JSON metadata.source_mode 必须是 docs 或 images")
     if not isinstance(metadata["dimensions"], list) or not metadata["dimensions"]:
         raise AssessmentError("评分JSON metadata.dimensions 必须是非空数组")
     for key in ("summary", "details", "anomalies", "evidence", "standard_answer_evidence", "failed_documents"):
@@ -1144,12 +1304,116 @@ def validate_result_schema(result: Any) -> dict[str, Any]:
             raise AssessmentError(f"评分JSON {key} 必须是数组")
     if not isinstance(result.get("cache_stats"), dict):
         raise AssessmentError("评分JSON cache_stats 必须是对象")
+
+    if run_status in {"complete", "pending_review", "output_failed"} and not result["summary"]:
+        raise AssessmentError(f"评分JSON run_status={run_status} 时必须至少包含一名学员")
+    if run_status in {"complete", "pending_review", "output_failed"} and (not result["evidence"] or not result["standard_answer_evidence"]):
+        raise AssessmentError(f"评分JSON run_status={run_status} 时必须保留完整证据索引和标准答案证据")
+    if run_status == "complete" and result["failed_documents"]:
+        raise AssessmentError("评分JSON complete 时 failed_documents 必须为空")
+    if any(not isinstance(item, dict) or not str(item.get("error") or "").strip() for item in result["failed_documents"]):
+        raise AssessmentError("评分JSON failed_documents 每项必须包含明确error")
+
+    dimensions = [str(value) for value in metadata["dimensions"]]
+    summaries_by_student: dict[str, dict[str, Any]] = {}
+    pending_seen = False
     for index, item in enumerate(result["summary"], start=1):
         if not isinstance(item, dict) or not str(item.get("student") or "").strip() or not isinstance(item.get("dimensions"), dict):
             raise AssessmentError(f"评分JSON summary 第{index}项不完整")
-        missing = [dimension for dimension in metadata["dimensions"] if dimension not in item["dimensions"]]
+        student = str(item["student"]).strip()
+        if student in summaries_by_student:
+            raise AssessmentError(f"评分JSON summary 学员重复：{student}")
+        summaries_by_student[student] = item
+        missing = [dimension for dimension in dimensions if dimension not in item["dimensions"]]
         if missing:
             raise AssessmentError(f"评分JSON summary 第{index}项缺少维度：{', '.join(missing)}")
+        accuracies: list[float | None] = []
+        student_pending = False
+        for dimension in dimensions:
+            dim = item["dimensions"][dimension]
+            if not isinstance(dim, dict):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 必须是对象")
+            correct, total, accuracy = dim.get("correct"), dim.get("total"), dim.get("accuracy")
+            wrong_ids, review_ids = dim.get("wrong_ids"), dim.get("review_ids")
+            if isinstance(correct, bool) or not isinstance(correct, int) or isinstance(total, bool) or not isinstance(total, int) or total <= 0 or not 0 <= correct <= total:
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的 correct/total 非法")
+            if not isinstance(wrong_ids, list) or not isinstance(review_ids, list):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的 wrong_ids/review_ids 必须是数组")
+            wrong = [str(value) for value in wrong_ids]
+            review = [str(value) for value in review_ids]
+            if len(wrong) != len(set(wrong)) or len(review) != len(set(review)) or set(wrong) & set(review):
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的错误ID或复核ID重复/冲突")
+            if correct + len(wrong) + len(review) != total:
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的正确、错误、复核数量与total不一致")
+            if review:
+                if accuracy is not None or dim.get("status") != "待复核":
+                    raise AssessmentError(f"评分JSON {student}/{dimension} 有review_ids时必须为待复核且accuracy=null")
+                student_pending = True
+                accuracies.append(None)
+            else:
+                if not _finite_number(accuracy) or not 0 <= float(accuracy) <= 1 or abs(float(accuracy) - correct / total) > 1e-9:
+                    raise AssessmentError(f"评分JSON {student}/{dimension} 的accuracy与correct/total不一致")
+                if dim.get("status") != "已完成":
+                    raise AssessmentError(f"评分JSON {student}/{dimension} 无复核项时状态必须为已完成")
+                accuracies.append(float(accuracy))
+        expected_overall = None if student_pending else sum(value for value in accuracies if value is not None) / len(accuracies)
+        if expected_overall is None:
+            if item.get("overall_accuracy") is not None or item.get("status") != "待复核":
+                raise AssessmentError(f"评分JSON {student} 存在复核维度时总状态必须待复核且总准确率为空")
+            pending_seen = True
+        elif not _finite_number(item.get("overall_accuracy")) or abs(float(item["overall_accuracy"]) - expected_overall) > 1e-9 or item.get("status") != "已完成":
+            raise AssessmentError(f"评分JSON {student} 的总准确率或状态不一致")
+
+    detail_counts: dict[tuple[str, str], dict[str, Any]] = {}
+    detail_keys: set[tuple[str, str, str]] = set()
+    for index, detail in enumerate(result["details"], start=1):
+        if not isinstance(detail, dict):
+            raise AssessmentError(f"评分JSON details 第{index}项必须是对象")
+        student, dimension, row_id = (str(detail.get(key) or "") for key in ("student", "dimension", "id"))
+        key = (student, dimension, row_id)
+        if not student or dimension not in dimensions or not row_id or key in detail_keys:
+            raise AssessmentError(f"评分JSON details 第{index}项身份为空、维度未知或重复")
+        if student not in summaries_by_student:
+            raise AssessmentError(f"评分JSON details 出现summary中不存在的学员：{student}")
+        outcome = detail.get("result")
+        if outcome not in {"正确", "错误", "待复核"}:
+            raise AssessmentError(f"评分JSON details 第{index}项结果非法")
+        detail_keys.add(key)
+        counts = detail_counts.setdefault((student, dimension), {"正确": 0, "错误": [], "待复核": []})
+        if outcome == "正确":
+            counts["正确"] += 1
+        else:
+            counts[outcome].append(row_id)
+
+    for student, item in summaries_by_student.items():
+        for dimension in dimensions:
+            dim = item["dimensions"][dimension]
+            counts = detail_counts.get((student, dimension), {"正确": 0, "错误": [], "待复核": []})
+            if counts["正确"] != dim["correct"] or set(counts["错误"]) != {str(value) for value in dim["wrong_ids"]} or set(counts["待复核"]) != {str(value) for value in dim["review_ids"]}:
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的summary与逐题明细不一致")
+            if counts["正确"] + len(counts["错误"]) + len(counts["待复核"]) != dim["total"]:
+                raise AssessmentError(f"评分JSON {student}/{dimension} 的逐题明细数量与total不一致")
+
+    source_mode = metadata.get("source_mode")
+    if source_mode in {"docs", "images"}:
+        expected_source = "docs" if source_mode == "docs" else "image_ocr"
+        if any(str(item.get("source") or "") != expected_source for item in result["evidence"]):
+            raise AssessmentError(f"评分JSON evidence 来源与 source_mode={source_mode} 不一致")
+        if any(str(item.get("source") or "") != expected_source for item in result["details"]):
+            raise AssessmentError(f"评分JSON details 来源与 source_mode={source_mode} 不一致")
+    if run_status == "complete" and pending_seen:
+        raise AssessmentError("评分JSON complete 时不能包含待复核学员")
+    if run_status == "pending_review" and not pending_seen:
+        raise AssessmentError("评分JSON pending_review 时必须包含待复核学员")
+    if run_status == "incomplete" and not result["failed_documents"]:
+        raise AssessmentError("评分JSON incomplete 时必须说明未完成文档及原因")
+    if result.get("stopped_items") is not None:
+        if not isinstance(result["stopped_items"], list) or any(not isinstance(item, dict) or not str(item.get("reason") or "").strip() or not str(item.get("next_action") or "").strip() for item in result["stopped_items"]):
+            raise AssessmentError("评分JSON stopped_items 必须是含明确reason和next_action的对象数组")
+    if run_status != "complete" and not result.get("stopped_items"):
+        raise AssessmentError(f"评分JSON {run_status} 时必须在 stopped_items 说明停止原因")
+    if run_status == "output_failed" and not any(item.get("stage") == "output" for item in result.get("stopped_items", [])):
+        raise AssessmentError("评分JSON output_failed 时必须说明输出阶段的停止原因")
     return result
 
 
@@ -1164,7 +1428,8 @@ def emit_optional_outputs(
     warnings: list[str] = []
     hard_output_failure = False
     if result.get("run_status") != "complete":
-        return None, None, ["任务证据不完整，已暂停PNG和Excel输出"], False
+        message = "存在待复核评分格，已暂停正式PNG和Excel输出" if result.get("run_status") == "pending_review" else "任务证据不完整，已暂停PNG和Excel输出"
+        return None, None, [message], False
     stem = safe_filename(f"{result['metadata']['group']}_{result['metadata']['progress']}_准确率")
     if png_mode == "on":
         try:
@@ -1191,6 +1456,58 @@ def emit_optional_outputs(
     return xlsx_path, png_path, warnings, hard_output_failure
 
 
+def new_run_id(result: dict[str, Any]) -> str:
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    entropy = stable_hash({
+        "time_ns": time.time_ns(),
+        "group": result.get("metadata", {}).get("group"),
+        "progress": result.get("metadata", {}).get("progress"),
+        "pid": os.getpid(),
+    })[:8]
+    return f"{timestamp}-{entropy}"
+
+
+def deliver_result(
+    result: dict[str, Any],
+    output_root: Path,
+    png_mode: str,
+    xlsx_mode: str,
+) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
+    """Publish one isolated run directory only after all requested artifacts finish."""
+    output_root = ensure_output_directory(output_root)
+    run_id = new_run_id(result)
+    result.setdefault("metadata", {})["run_id"] = run_id
+    stem = safe_filename(f"{result['metadata']['group']}_{result['metadata']['progress']}")
+    final_dir = output_root / f"{stem}__{run_id}"
+    stage_dir = Path(tempfile.mkdtemp(prefix=f".{stem}__", dir=output_root))
+    try:
+        staged_xlsx, staged_png, warnings, hard_failure = emit_optional_outputs(result, stage_dir, png_mode, xlsx_mode)
+        if hard_failure:
+            for path in (staged_xlsx, staged_png):
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            staged_xlsx = None
+            staged_png = None
+            result["run_status"] = "output_failed"
+        final_xlsx = final_dir / staged_xlsx.name if staged_xlsx else None
+        final_png = final_dir / staged_png.name if staged_png else None
+        final_json = final_dir / result_filename(result["metadata"]["group"], result["metadata"]["progress"])
+        result["output_warnings"] = warnings
+        result["stopped_items"] = stopped_items_for(result, warnings)
+        result["outputs"] = {
+            "json": str(final_json),
+            "png": str(final_png) if final_png else None,
+            "xlsx": str(final_xlsx) if final_xlsx else None,
+        }
+        validate_result_schema(result)
+        save_result(result, stage_dir)
+        os.replace(stage_dir, final_dir)
+        return final_xlsx, final_png, result, final_json, hard_failure
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+
+
 def build_scored_result(
     *,
     profile_key: str,
@@ -1213,9 +1530,8 @@ def build_scored_result(
     allowed_source = "image_ocr" if source_mode == "images" else "docs"
     if any(document.get("source", "") != allowed_source for document in standard_documents):
         raise AssessmentError(f"考试 {profile['display_name']} 的标准答案必须来自 {allowed_source} 证据")
-    if source_mode == "docs":
-        if any(document.get("source", "") != "docs" for document in homework_documents):
-            raise AssessmentError(f"考试 {profile['display_name']} 的作业必须来自 Docs 结构化读取证据")
+    if any(document.get("source", "") != allowed_source for document in homework_documents):
+        raise AssessmentError(f"考试 {profile['display_name']} 的作业必须来自 {allowed_source} 证据")
 
     standard = parse_standard(standard_documents, dimensions, config)
     if homework_documents:
@@ -1235,9 +1551,11 @@ def build_scored_result(
     failures = list(failed_documents or [])
     if not students and not failures:
         failures.append({"role": "homework", "student": "", "error": "没有发现任何有效学员作业"})
+    pending_review = any(item.get("status") == "待复核" for item in scored["summary"])
+    run_status = "incomplete" if failures else ("pending_review" if pending_review else "complete")
     result = {
-        "schema_version": 2,
-        "run_status": "incomplete" if failures else "complete",
+        "schema_version": 3,
+        "run_status": run_status,
         "metadata": {
             "exam_profile": profile_key,
             "exam_name": profile["display_name"],
@@ -1257,8 +1575,10 @@ def build_scored_result(
         "cache_stats": {"scores": score_cache_stats},
         "output_warnings": [],
     }
+    result["stopped_items"] = stopped_items_for(result)
     if len(result["summary"]) != len(students):
         raise AssessmentError("内部校验失败：汇总人数与证据人数不一致")
+    validate_result_schema(result)
     return result
 
 
@@ -1374,14 +1694,8 @@ def run_image_manifest(
         ocr_confidence_threshold=float(runtime["ocr_confidence_threshold"]),
         ocr_stats=ocr_stats or None,
     )
-    output_dir = ensure_output_directory(output_directory(args, manifest))
-    result_path = save_result(result, output_dir)
     png_mode, xlsx_mode = normalize_output_settings(args, manifest)
-    xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
-    result["output_warnings"] = warnings
-    result["outputs"] = {"json": str(result_path), "png": str(png_path) if png_path else None, "xlsx": str(xlsx_path) if xlsx_path else None}
-    save_result(result, output_dir)
-    return xlsx_path, png_path, result, result_path, hard_failure
+    return deliver_result(result, output_directory(args, manifest), png_mode, xlsx_mode)
 
 
 def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
@@ -1396,9 +1710,8 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
     standard_path, homework_paths, _ = scoring_documents(manifest)
     failures = manifest_failures(manifest)
     if standard_path is None:
-        output_dir = ensure_output_directory(output_directory(args, manifest))
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_status": "incomplete",
             "metadata": {
                 "exam_profile": manifest["exam_profile"],
@@ -1419,8 +1732,9 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
             "cache_stats": {"scores": {"hits": 0, "misses": 0}},
             "output_warnings": ["标准答案未就绪，已保存续跑状态"],
         }
-        result_path = save_result(result, output_dir)
-        return None, None, result, result_path, False
+        result["stopped_items"] = stopped_items_for(result)
+        png_mode, xlsx_mode = normalize_output_settings(args, manifest)
+        return deliver_result(result, output_directory(args, manifest), png_mode, xlsx_mode)
 
     aliases_path = resolve_path(Path(manifest["_base"]), manifest.get("name_aliases"))
     aliases = load_aliases(aliases_path)
@@ -1444,14 +1758,8 @@ def run_manifest(args: argparse.Namespace) -> tuple[Path | None, Path | None, di
         "success": sum(1 for item in state.get("documents", {}).values() if item.get("status") == "success"),
         "pending_or_failed": len(failures),
     }
-    output_dir = ensure_output_directory(output_directory(args, manifest))
-    result_path = save_result(result, output_dir)
     png_mode, xlsx_mode = normalize_output_settings(args, manifest)
-    xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
-    result["output_warnings"] = warnings
-    result["outputs"] = {"json": str(result_path), "png": str(png_path) if png_path else None, "xlsx": str(xlsx_path) if xlsx_path else None}
-    save_result(result, output_dir)
-    return xlsx_path, png_path, result, result_path, hard_failure
+    return deliver_result(result, output_directory(args, manifest), png_mode, xlsx_mode)
 
 
 def run_direct(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
@@ -1519,14 +1827,8 @@ def run_direct(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict
         ocr_confidence_threshold=float(args.ocr_confidence_threshold),
         ocr_stats=ocr_stats or None,
     )
-    output_dir = ensure_output_directory(output_directory(args))
-    result_path = save_result(result, output_dir)
     png_mode, xlsx_mode = normalize_output_settings(args)
-    xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
-    result["output_warnings"] = warnings
-    result["outputs"] = {"json": str(result_path), "png": str(png_path) if png_path else None, "xlsx": str(xlsx_path) if xlsx_path else None}
-    save_result(result, output_dir)
-    return xlsx_path, png_path, result, result_path, hard_failure
+    return deliver_result(result, output_directory(args), png_mode, xlsx_mode)
 
 
 def run_from_result(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any], Path, bool]:
@@ -1534,17 +1836,16 @@ def run_from_result(args: argparse.Namespace) -> tuple[Path | None, Path | None,
         result = json.loads(args.result_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AssessmentError(f"无法读取评分JSON：{args.result_json}：{exc}") from exc
-    result.setdefault("run_status", "complete")
     result.setdefault("output_warnings", [])
+    result.setdefault("stopped_items", stopped_items_for(result, list(result.get("output_warnings") or [])))
     validate_result_schema(result)
-    output_dir = ensure_output_directory(output_directory(args))
+    if result["run_status"] == "output_failed":
+        # The scoring result is valid; a later rerender may recover after the output dependency is fixed.
+        result["run_status"] = "complete"
+        result["output_warnings"] = []
+        result["stopped_items"] = []
     png_mode, xlsx_mode = normalize_output_settings(args)
-    xlsx_path, png_path, warnings, hard_failure = emit_optional_outputs(result, output_dir, png_mode, xlsx_mode)
-    result["output_warnings"] = warnings
-    result_path = save_result(result, output_dir)
-    result["outputs"] = {"json": str(result_path), "png": str(png_path) if png_path else None, "xlsx": str(xlsx_path) if xlsx_path else None}
-    save_result(result, output_dir)
-    return xlsx_path, png_path, result, result_path, hard_failure
+    return deliver_result(result, output_directory(args), png_mode, xlsx_mode)
 
 
 def run(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, Any]]:
@@ -1570,7 +1871,7 @@ def run(args: argparse.Namespace) -> tuple[Path | None, Path | None, dict[str, A
 
 
 def summary_text(result: dict[str, Any]) -> str:
-    lines = [f"{result['metadata']['group']} {result['metadata']['progress']}：{result.get('run_status', 'complete')}"]
+    lines = [f"{result['metadata']['group']} {result['metadata']['progress']}：{result['run_status']}"]
     dimensions = result["metadata"].get("dimensions", [])
     for item in result.get("summary", []):
         if len(dimensions) == 1:
@@ -1578,8 +1879,9 @@ def summary_text(result: dict[str, Any]) -> str:
         else:
             rate = item.get("overall_accuracy")
         lines.append(f"{item['student']}：{percent_text(rate, 2)}")
-    for failed in result.get("failed_documents", []):
-        lines.append(f"读取失败/待续跑：{failed.get('student') or failed.get('role')}：{failed.get('error', '')}")
+    for stopped in result.get("stopped_items", []):
+        target = "/".join(value for value in (stopped.get("student"), stopped.get("dimension"), stopped.get("id")) if value) or stopped.get("role") or stopped.get("stage")
+        lines.append(f"未继续：{target}：{stopped.get('reason', '')}；下一步：{stopped.get('next_action', '')}")
     return "\n".join(lines)
 
 
@@ -1587,8 +1889,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         xlsx_path, png_path, result = run(args)
-    except (AssessmentError, ManifestError, OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
+        print(json.dumps({
+            "status": "stopped",
+            "stopped_items": [{
+                "stage": "execution",
+                "reason": str(exc),
+                "next_action": "按错误信息修复输入、权限、结构或运行环境后重新执行",
+            }],
+        }, ensure_ascii=False), file=sys.stderr)
         return 2
     if args.summary_only:
         print(summary_text(result))
@@ -1604,11 +1914,16 @@ def main(argv: list[str] | None = None) -> int:
                 "pending_students": pending,
                 "anomalies": len(result["anomalies"]),
                 "warnings": result.get("output_warnings", []),
+                "stopped_items": result.get("stopped_items", []),
             },
             ensure_ascii=False,
         )
     )
-    if result.get("run_status") != "complete":
+    if result.get("run_status") == "output_failed":
+        return 3
+    if result.get("run_status") == "pending_review":
+        return 5
+    if result.get("run_status") == "incomplete":
         return 4
     if result.get("_hard_output_failure"):
         return 3

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -16,6 +17,23 @@ from typing import Any
 
 class ApiOcrError(RuntimeError):
     pass
+
+
+def _normalize_id(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        return str(int(value)) if value.is_integer() else format(value, ".15g")
+    text = re.sub(r"\s+", "", str(value))
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return str(int(float(text)))
+    if re.fullmatch(r"\d+", text):
+        return str(int(text))
+    return text
 
 
 def _required_setting(name: str, fallback: str = "") -> str:
@@ -84,18 +102,30 @@ def _parse_json_text(text: str) -> dict[str, Any]:
             raise ApiOcrError(f"OCR API 第{index}行与表头列数不一致")
         normalized_rows.append(row)
     confidence = payload.get("confidence")
-    if confidence is None:
-        confidence = {}
     if not isinstance(confidence, dict):
-        raise ApiOcrError("OCR API confidence 必须是对象")
+        raise ApiOcrError("OCR API confidence 必须是逐题数值对象，不能缺失")
+    row_ids = [_normalize_id(row[0]) for row in normalized_rows]
+    if any(not row_id for row_id in row_ids) or len(row_ids) != len(set(row_ids)):
+        raise ApiOcrError("OCR API 结果的题目ID为空或规范化后重复")
+    normalized_confidence: dict[str, float] = {}
+    for raw_key, raw_value in confidence.items():
+        row_id = _normalize_id(raw_key)
+        if not row_id or row_id in normalized_confidence:
+            raise ApiOcrError("OCR API confidence 的ID为空或规范化后重复")
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise ApiOcrError(f"OCR API confidence[{raw_key!r}] 必须是0–1有限数值")
+        value = float(raw_value)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ApiOcrError(f"OCR API confidence[{raw_key!r}] 必须在0–1之间")
+        normalized_confidence[row_id] = value
+    missing_confidence = [row_id for row_id in row_ids if row_id not in normalized_confidence]
+    extra_confidence = [row_id for row_id in normalized_confidence if row_id not in set(row_ids)]
+    if missing_confidence or extra_confidence:
+        raise ApiOcrError(f"OCR API confidence 与题目ID未完全对齐：缺失={missing_confidence}，额外={extra_confidence}")
     payload["student_name"] = str(payload.get("student_name") or "").strip()
     payload["headers"] = headers
     payload["rows"] = normalized_rows
-    payload["confidence"] = {
-        str(key): max(0.0, min(1.0, float(value)))
-        for key, value in confidence.items()
-        if isinstance(value, (int, float))
-    }
+    payload["confidence"] = normalized_confidence
     return payload
 
 

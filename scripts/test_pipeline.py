@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -363,6 +365,125 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["summary"][0]["status"], "待复核")
         self.assertEqual(result["summary"][0]["dimensions"]["画面美学"]["review_ids"], ["1"])
 
+    def test_pending_review_blocks_formal_outputs_and_reports_every_stop_reason(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            standard = document(["ID", "画面美学"], [[1, "都一般"]], source="image_ocr")
+            standard["confidence"] = {"1": 0.99}
+            homework = document(["ID", "画面美学"], [[1, "都一般"]], student_name="王五", source="image_ocr")
+            homework["confidence"] = {"1": 0.4}
+            standard_path, homework_path = temp / "standard.json", temp / "homework.json"
+            write_json(standard_path, standard)
+            write_json(homework_path, homework)
+            args = pipeline.parse_args([
+                "--exam-profile", "screenshot-image-aesthetic", "--group", "29组", "--progress", "待复核门禁",
+                "--standard-evidence", str(standard_path), "--homework-evidence", str(homework_path),
+                "--output", str(temp / "delivery"), "--png", "on", "--xlsx", "on",
+            ])
+            xlsx, png, result = pipeline.run(args)
+            self.assertEqual(result["run_status"], "pending_review")
+            self.assertIsNone(xlsx)
+            self.assertIsNone(png)
+            self.assertEqual(result["outputs"]["xlsx"], None)
+            self.assertEqual(result["outputs"]["png"], None)
+            self.assertTrue(result["stopped_items"])
+            self.assertTrue(all(item["reason"] and item["next_action"] for item in result["stopped_items"]))
+            self.assertTrue(Path(result["_result_path"]).exists())
+            completed = subprocess.run(
+                [
+                    sys.executable, str(MODULE_PATH),
+                    "--exam-profile", "screenshot-image-aesthetic", "--group", "29组", "--progress", "待复核门禁CLI",
+                    "--standard-evidence", str(standard_path), "--homework-evidence", str(homework_path),
+                    "--output", str(temp / "cli-delivery"), "--png", "on", "--xlsx", "on",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 5, completed.stderr)
+            cli_payload = json.loads(completed.stdout.strip().splitlines()[-1])
+            self.assertEqual(cli_payload["status"], "pending_review")
+            self.assertTrue(cli_payload["stopped_items"][0]["reason"])
+
+    def test_standard_and_missing_or_misaligned_homework_confidence_require_review(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+
+            def loaded(std_conf, homework_conf):
+                std = document(["ID", "画面美学"], [[1, "都一般"]], source="image_ocr")
+                hw = document(["ID", "画面美学"], [[1, "都一般"]], student_name="王五", source="image_ocr")
+                if std_conf is not None:
+                    std["confidence"] = std_conf
+                if homework_conf is not None:
+                    hw["confidence"] = homework_conf
+                std_path, hw_path = temp / "std.json", temp / "hw.json"
+                write_json(std_path, std)
+                write_json(hw_path, hw)
+                return pipeline.load_evidence_files([std_path]), pipeline.load_evidence_files([hw_path])
+
+            for label, std_conf, homework_conf in [
+                ("low-standard", {"1": 0.1}, {"1": 0.99}),
+                ("missing-homework", {"1": 0.99}, None),
+                ("normalized-low-key", {"1": 0.99}, {"1.0": 0.1}),
+                ("invalid-homework", {"1": 0.99}, {"1": "0.1"}),
+            ]:
+                with self.subTest(label=label):
+                    standard_docs, homework_docs = loaded(std_conf, homework_conf)
+                    result = pipeline.build_scored_result(
+                        profile_key="screenshot-image-aesthetic", group="29组", progress=label,
+                        standard_documents=standard_docs, homework_documents=homework_docs,
+                        aliases={}, source_mode="images", ocr_confidence_threshold=0.75,
+                    )
+                    self.assertEqual(result["run_status"], "pending_review")
+                    self.assertEqual(result["summary"][0]["status"], "待复核")
+                    self.assertTrue(result["stopped_items"][0]["reason"])
+
+    def test_score_cache_invalidates_when_ocr_confidence_changes(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            config = self.config
+            dimensions = ["画面美学"]
+            student_doc = document(["ID", "画面美学"], [[1, "都一般"]], student_name="王五", source="image_ocr")
+            student_doc["confidence"] = {"1": 0.99}
+            students, anomalies = pipeline.parse_homework_documents([student_doc], dimensions, config, {})
+
+            def parsed_standard(confidence):
+                standard_doc = document(["ID", "画面美学"], [[1, "都一般"]], source="image_ocr")
+                standard_doc["confidence"] = {"1": confidence}
+                return pipeline.parse_standard([standard_doc], dimensions, config)
+
+            profile = config["profiles"]["screenshot-image-aesthetic"]
+            high, high_stats, _ = pipeline.score_students_incremental(
+                parsed_standard(0.99), students, dimensions, anomalies, profile, {}, Path(temp_name), 0.75,
+            )
+            low, low_stats, _ = pipeline.score_students_incremental(
+                parsed_standard(0.1), students, dimensions, anomalies, profile, {}, Path(temp_name), 0.75,
+            )
+            self.assertEqual(high["summary"][0]["status"], "已完成")
+            self.assertEqual(low["summary"][0]["status"], "待复核")
+            self.assertEqual(high_stats["misses"], 1)
+            self.assertEqual(low_stats["misses"], 1)
+
+    def test_ocr_api_confidence_contract_is_strict_and_normalizes_ids(self):
+        base = {"student_name": "王五", "headers": ["ID", "画面美学"], "rows": [["46.0", "都一般"]]}
+        valid = ocr_api._parse_json_text(json.dumps({**base, "confidence": {"46.0": 0.9}}, ensure_ascii=False))
+        self.assertEqual(valid["confidence"], {"46": 0.9})
+        for confidence in (None, {"46.0": "0.1"}, {"46.0": True}, {"46.0": 2.5}, {"99": 0.9}):
+            payload = dict(base)
+            if confidence is not None:
+                payload["confidence"] = confidence
+            with self.subTest(confidence=confidence), self.assertRaises(ocr_api.ApiOcrError):
+                ocr_api._parse_json_text(json.dumps(payload, ensure_ascii=False))
+
+    def test_image_profile_rejects_docs_homework_evidence(self):
+        standard = document(["ID", "画面美学"], [[1, "都一般"]], source="image_ocr")
+        standard["confidence"] = {"1": 0.99}
+        homework = document(["ID", "画面美学"], [[1, "都一般"]], student_name="王五", source="docs")
+        with self.assertRaisesRegex(pipeline.AssessmentError, "作业必须来自 image_ocr"):
+            pipeline.build_scored_result(
+                profile_key="screenshot-image-aesthetic", group="29组", progress="来源门禁",
+                standard_documents=[standard], homework_documents=[homework], aliases={}, source_mode="images",
+            )
+
     def test_api_ocr_processes_screenshot_homework_concurrently(self):
         with tempfile.TemporaryDirectory() as temp_name:
             paths = []
@@ -468,6 +589,19 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual({item["status"] for item in results}, {"success"})
             state = runtime.load_state(manifest)
             self.assertTrue(all(state["documents"][item["item_id"]]["status"] == "success" for item, _ in files))
+
+    def test_old_lock_owner_cannot_delete_replacement_lock(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, manifest_payload())
+            manifest = runtime.load_manifest(manifest_path)
+            lock_path = runtime.state_path(manifest).with_suffix(".lock")
+            with runtime.state_lock(manifest):
+                replacement = {"pid": 99999999, "token": "replacement-owner", "created_at": time.time()}
+                lock_path.write_text(json.dumps(replacement), encoding="utf-8")
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["token"], "replacement-owner")
 
     def test_specs_command_lists_stable_item_ids_without_writing_state(self):
         with tempfile.TemporaryDirectory() as temp_name:
@@ -875,8 +1009,100 @@ class PipelineTests(unittest.TestCase):
             result_path = temp / "broken.json"
             write_json(result_path, {"schema_version": 2, "metadata": {"group": "29组"}})
             args = pipeline.parse_args(["--result-json", str(result_path), "--output", str(temp / "delivery")])
-            with self.assertRaisesRegex(pipeline.AssessmentError, "metadata 缺少 progress"):
+            with self.assertRaisesRegex(pipeline.AssessmentError, "缺少 run_status"):
                 pipeline.run(args)
+
+    def test_result_json_rejects_cross_field_contradictions(self):
+        result = pipeline.build_scored_result(
+            profile_key="retake-image-aesthetic", group="29组", progress="语义门禁",
+            standard_documents=[document(["ID", "画面美学"], [[1, "都一般"]])],
+            homework_documents=[document(["同学名称", "ID", "画面美学"], [["王五", 1, "都一般"]])],
+            aliases={}, source_mode="docs",
+        )
+        contradictions = []
+        failed_complete = json.loads(json.dumps(result, ensure_ascii=False))
+        failed_complete["failed_documents"] = [{"role": "homework", "error": "读取失败"}]
+        contradictions.append((failed_complete, "failed_documents"))
+        bad_math = json.loads(json.dumps(result, ensure_ascii=False))
+        bad_math["summary"][0]["dimensions"]["画面美学"]["accuracy"] = 1.5
+        contradictions.append((bad_math, "accuracy"))
+        bad_details = json.loads(json.dumps(result, ensure_ascii=False))
+        bad_details["details"][0]["result"] = "错误"
+        contradictions.append((bad_details, "summary与逐题明细"))
+        empty = json.loads(json.dumps(result, ensure_ascii=False))
+        empty["summary"] = []
+        empty["details"] = []
+        contradictions.append((empty, "至少包含一名学员"))
+        for payload, message in contradictions:
+            with self.subTest(message=message), self.assertRaisesRegex(pipeline.AssessmentError, message):
+                pipeline.validate_result_schema(payload)
+
+    def test_each_run_is_atomically_isolated_and_never_reuses_old_artifact_names(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            output = temp / "delivery"
+            complete = pipeline.build_scored_result(
+                profile_key="retake-image-aesthetic", group="29组", progress="生命周期",
+                standard_documents=[document(["ID", "画面美学"], [[1, "都一般"]])],
+                homework_documents=[document(["同学名称", "ID", "画面美学"], [["王五", 1, "都一般"]])],
+                aliases={}, source_mode="docs",
+            )
+            xlsx, png, first, first_json, _ = pipeline.deliver_result(complete, output, "on", "on")
+            self.assertTrue(xlsx and xlsx.exists())
+            self.assertTrue(png and png.exists())
+            incomplete = json.loads(json.dumps(complete, ensure_ascii=False))
+            incomplete["run_status"] = "incomplete"
+            incomplete["failed_documents"] = [{"role": "homework", "student": "李四", "error": "无权访问"}]
+            incomplete["stopped_items"] = pipeline.stopped_items_for(incomplete)
+            _, _, second, second_json, _ = pipeline.deliver_result(incomplete, output, "on", "on")
+            self.assertNotEqual(first_json.parent, second_json.parent)
+            self.assertTrue(first_json.exists() and second_json.exists())
+            self.assertIsNone(second["outputs"]["png"])
+            self.assertIsNone(second["outputs"]["xlsx"])
+            self.assertEqual(list(second_json.parent.glob("*.png")), [])
+            self.assertEqual(list(second_json.parent.glob("*.xlsx")), [])
+
+    def test_output_failure_rolls_back_all_formal_artifacts_and_reports_reason(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            result = pipeline.build_scored_result(
+                profile_key="retake-image-aesthetic", group="29组", progress="原子回滚",
+                standard_documents=[document(["ID", "画面美学"], [[1, "都一般"]])],
+                homework_documents=[document(["同学名称", "ID", "画面美学"], [["王五", 1, "都一般"]])],
+                aliases={}, source_mode="docs",
+            )
+            with patch.object(pipeline, "build_workbook", side_effect=pipeline.AssessmentError("模拟Excel失败")):
+                xlsx, png, failed, result_path, hard = pipeline.deliver_result(result, Path(temp_name), "on", "on")
+            self.assertTrue(hard)
+            self.assertEqual(failed["run_status"], "output_failed")
+            self.assertIsNone(xlsx)
+            self.assertIsNone(png)
+            self.assertTrue(result_path.exists())
+            self.assertEqual(list(result_path.parent.glob("*.png")), [])
+            self.assertEqual(list(result_path.parent.glob("*.xlsx")), [])
+            self.assertTrue(any(item["stage"] == "output" and "模拟Excel失败" in item["reason"] for item in failed["stopped_items"]))
+            retry_args = pipeline.parse_args([
+                "--result-json", str(result_path), "--output", str(Path(temp_name) / "retry"),
+                "--png", "on", "--xlsx", "on",
+            ])
+            retry_xlsx, retry_png, recovered = pipeline.run(retry_args)
+            self.assertEqual(recovered["run_status"], "complete")
+            self.assertTrue(retry_xlsx and retry_xlsx.exists())
+            self.assertTrue(retry_png and retry_png.exists())
+
+    def test_direct_evidence_uses_same_strict_validator_as_manifest_ingest(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            missing_id = document(["ID", "画面美学"], [[1, "都一般"]])
+            missing_id["document"]["id"] = ""
+            missing_id_path = temp / "missing-id.json"
+            write_json(missing_id_path, missing_id)
+            with self.assertRaisesRegex(pipeline.AssessmentError, "document.id"):
+                pipeline.load_evidence_files([missing_id_path])
+            object_row = document(["ID", "画面美学"], [{"ID": 1, "画面美学": "都一般"}])
+            object_row_path = temp / "object-row.json"
+            write_json(object_row_path, object_row)
+            with self.assertRaisesRegex(pipeline.AssessmentError, "必须是数组"):
+                pipeline.load_evidence_files([object_row_path])
 
     def test_output_path_that_is_a_file_is_rejected_cleanly(self):
         with tempfile.TemporaryDirectory() as temp_name:
@@ -884,12 +1110,12 @@ class PipelineTests(unittest.TestCase):
             output_file = temp / "not-a-directory"
             output_file.write_text("x", encoding="utf-8")
             result_path = temp / "result.json"
-            payload = {
-                "schema_version": 2, "run_status": "complete",
-                "metadata": {"group": "29组", "progress": "测试", "dimensions": ["画面美学"]},
-                "summary": [], "details": [], "anomalies": [], "evidence": [],
-                "standard_answer_evidence": [], "failed_documents": [], "cache_stats": {},
-            }
+            payload = pipeline.build_scored_result(
+                profile_key="retake-image-aesthetic", group="29组", progress="测试",
+                standard_documents=[document(["ID", "画面美学"], [[1, "都一般"]])],
+                homework_documents=[document(["同学名称", "ID", "画面美学"], [["王五", 1, "都一般"]])],
+                aliases={}, source_mode="docs",
+            )
             write_json(result_path, payload)
             args = pipeline.parse_args(["--result-json", str(result_path), "--output", str(output_file)])
             with self.assertRaisesRegex(pipeline.AssessmentError, "文件而不是文件夹"):
@@ -912,6 +1138,86 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertIn("错误：", completed.stderr)
             self.assertNotIn("Traceback", completed.stderr)
+            stopped = json.loads(completed.stderr.strip().splitlines()[-1])
+            self.assertTrue(stopped["stopped_items"][0]["reason"])
+            self.assertTrue(stopped["stopped_items"][0]["next_action"])
+            invalid_args = subprocess.run(
+                [sys.executable, str(Path(runtime.__file__)), "--not-a-real-option"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(invalid_args.returncode, 2)
+            invalid_payload = json.loads(invalid_args.stderr.strip().splitlines()[-1])
+            self.assertEqual(invalid_payload["status"], "stopped")
+            self.assertIn("命令参数错误", invalid_payload["stopped_items"][0]["reason"])
+            self.assertTrue(invalid_payload["stopped_items"][0]["next_action"])
+
+    def test_assessment_cli_always_reports_why_execution_stopped(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            completed = subprocess.run(
+                [
+                    sys.executable, str(MODULE_PATH), "--result-json", str(temp / "missing.json"),
+                    "--output", str(temp / "delivery"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            payload = json.loads(completed.stderr.strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "stopped")
+            self.assertTrue(payload["stopped_items"][0]["reason"])
+            self.assertTrue(payload["stopped_items"][0]["next_action"])
+            invalid_args = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--png", "invalid"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(invalid_args.returncode, 2)
+            invalid_payload = json.loads(invalid_args.stderr.strip().splitlines()[-1])
+            self.assertIn("命令参数错误", invalid_payload["stopped_items"][0]["reason"])
+            unknown_args = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--not-a-real-option"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(unknown_args.returncode, 2)
+            unknown_payload = json.loads(unknown_args.stderr.strip().splitlines()[-1])
+            self.assertEqual(unknown_payload["status"], "stopped")
+            self.assertIn("命令参数错误", unknown_payload["stopped_items"][0]["reason"])
+            self.assertTrue(unknown_payload["stopped_items"][0]["next_action"])
+
+    def test_flat_layout_package_uses_skill_name_for_file_and_archive_root(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            flat = Path(temp_name)
+            project_root = Path(__file__).resolve().parent.parent
+            shutil.copy2(project_root / "SKILL.md", flat / "SKILL.md")
+            shutil.copy2(project_root / "requirements.txt", flat / "requirements.txt")
+            shutil.copy2(project_root / "agents" / "openai.yaml", flat / "openai.yaml")
+            for name in ("exam_profiles.json", "evidence-schema.md", "manifest.md"):
+                shutil.copy2(project_root / "references" / name, flat / name)
+            for name in (
+                "run_assessment.py", "manifest_runtime.py", "build_workbook.py", "ocr_api.py",
+                "ocr_vision.swift", "package_skill.py", "test_pipeline.py",
+            ):
+                shutil.copy2(project_root / "scripts" / name, flat / name)
+            completed = subprocess.run(
+                [sys.executable, str(flat / "package_skill.py")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            archive_path = flat / "dist" / "score-kuaishou-exams.zip"
+            self.assertTrue(archive_path.is_file())
+            with zipfile.ZipFile(archive_path) as archive:
+                names = archive.namelist()
+            self.assertTrue(names)
+            self.assertTrue(all(name.startswith("score-kuaishou-exams/") for name in names))
 
     def test_zero_student_result_is_incomplete(self):
         result = pipeline.build_scored_result(
@@ -939,6 +1245,13 @@ class PipelineTests(unittest.TestCase):
             workbook = load_workbook(xlsx, data_only=False)
             self.assertEqual(workbook["成绩汇总"]["C2"].value, "'=1+1")
             workbook.close()
+
+    def test_excel_sanitizes_leading_whitespace_formulas_and_illegal_xml_controls(self):
+        import build_workbook as workbook_builder
+
+        self.assertEqual(workbook_builder.safe_excel_value(" \t=1+1"), "' \t=1+1")
+        self.assertEqual(workbook_builder.safe_excel_value("\r@cmd"), "'\r@cmd")
+        self.assertEqual(workbook_builder.safe_excel_value("王\x00五"), "王�五")
 
     def test_end_to_end_png_without_workbook(self):
         with tempfile.TemporaryDirectory() as temp_name:

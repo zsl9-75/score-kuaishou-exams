@@ -156,7 +156,9 @@ python3 scripts/manifest_runtime.py ingest-batch \
 - `output.png` 是 `on|off`，默认 `off`。
 - `output.xlsx` 是 `auto|on|off`，默认 `off`。
 - `output.dir` 必须是绝对交付目录；推荐每次显式传绝对 `--output`，避免返回Skill目录或临时目录。
+- 每次运行在 `output.dir` 下生成独立的 `组别_进度__run_id/` 原子发布目录；正式JSON中的绝对路径是本次唯一交付依据。
 - `cache.dir` 默认 `.score-cache`，必须留在本地运行目录，不进入交付 ZIP。
 - `runtime.ocr_workers` 是API OCR并发数，默认4，只允许1–8；`runtime.ocr_confidence_threshold` 默认0.75。
 - `runtime.ocr_engine` 是 `auto|vision|api`；`auto` 在macOS使用Vision，其他系统使用API。
+- 截图标准答案与作业都必须逐题提供有效OCR置信度；任何待复核项都会停止正式PNG/Excel并写入 `stopped_items`。
 - 作业索引变化后，已删除学员标记为 `removed`，新增或链接变化的学员创建新读取项，未变学员继续复用缓存。

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 import time
@@ -22,7 +23,13 @@ RETRYABLE_ERROR_KINDS = {"429", "timeout", "transient_5xx"}
 FATAL_ERROR_KINDS = {"permission", "not_found", "invalid_evidence", "metadata_mismatch", "other"}
 SPECIAL_ERROR_KINDS = {"layout_mismatch"}
 INCOMPLETE_DOCUMENT_STATUSES = {"pending", "failed", "deferred_layout", "pending_retry", "preflight_retry", "needs_discovery", "in_progress"}
-PROFILE_CONFIG_PATH = Path(__file__).resolve().parent.parent / "references" / "exam_profiles.json"
+RUNTIME_DIR = Path(__file__).resolve().parent
+if (RUNTIME_DIR.parent / "references" / "exam_profiles.json").is_file():
+    PROFILE_CONFIG_PATH = RUNTIME_DIR.parent / "references" / "exam_profiles.json"
+elif (RUNTIME_DIR / "exam_profiles.json").is_file():
+    PROFILE_CONFIG_PATH = RUNTIME_DIR / "exam_profiles.json"
+else:
+    PROFILE_CONFIG_PATH = RUNTIME_DIR.parent / "references" / "exam_profiles.json"
 
 
 class ManifestError(RuntimeError):
@@ -31,6 +38,11 @@ class ManifestError(RuntimeError):
 
 class LayoutMismatch(ManifestError):
     pass
+
+
+class ManifestArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ManifestError(f"命令参数错误：{message}")
 
 
 def stable_hash(value: Any) -> str:
@@ -209,13 +221,44 @@ def state_lock(manifest: dict[str, Any]):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 30
     descriptor: int | None = None
+    owner_token = secrets.token_hex(16)
+
+    def process_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def lock_owner() -> tuple[int, str]:
+        try:
+            text = lock_path.read_text(encoding="utf-8")
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                return 0, ""
+            return int(payload.get("pid", 0)), str(payload.get("token") or "")
+        except json.JSONDecodeError:
+            try:
+                return int(text.splitlines()[0]), ""
+            except (ValueError, IndexError):
+                return 0, ""
+        except (OSError, ValueError, TypeError):
+            return 0, ""
+
     while descriptor is None:
         try:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(descriptor, f"{os.getpid()}\n{time.time()}\n".encode("utf-8"))
+            os.write(descriptor, json.dumps({"pid": os.getpid(), "token": owner_token, "created_at": time.time()}).encode("utf-8"))
         except FileExistsError:
             try:
-                if time.time() - lock_path.stat().st_mtime > 120:
+                pid, _ = lock_owner()
+                if time.time() - lock_path.stat().st_mtime > 120 and not process_alive(pid):
                     lock_path.unlink(missing_ok=True)
                     continue
             except OSError:
@@ -230,7 +273,9 @@ def state_lock(manifest: dict[str, Any]):
             if descriptor is not None:
                 os.close(descriptor)
         finally:
-            lock_path.unlink(missing_ok=True)
+            _, current_token = lock_owner()
+            if current_token == owner_token:
+                lock_path.unlink(missing_ok=True)
 
 
 def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -948,7 +993,7 @@ def scoring_documents(manifest: dict[str, Any]) -> tuple[Path | None, list[tuple
 
 
 def cli() -> int:
-    parser = argparse.ArgumentParser(description="Manifest证据缓存与续跑状态管理")
+    parser = ManifestArgumentParser(description="Manifest证据缓存与续跑状态管理")
     sub = parser.add_subparsers(dest="command", required=True)
     specs = sub.add_parser("specs")
     specs.add_argument("--manifest", required=True, type=Path)
@@ -995,8 +1040,16 @@ def cli() -> int:
 def main() -> int:
     try:
         return cli()
-    except (ManifestError, OSError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
+        print(json.dumps({
+            "status": "stopped",
+            "stopped_items": [{
+                "stage": "manifest",
+                "reason": str(exc),
+                "next_action": "修复Manifest、证据、权限或读取状态后，复用同一 task_id 继续执行",
+            }],
+        }, ensure_ascii=False), file=sys.stderr)
         return 2
 
 

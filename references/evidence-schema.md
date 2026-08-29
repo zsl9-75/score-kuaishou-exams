@@ -65,16 +65,19 @@
 - `document.url`、`id`、`revision`、`sheet`、`range` 用于审计和缓存；没有 revision 时保留空字符串。
 - 不读取与目标表格无关的工作表和范围。
 
-评分脚本的 schema v2 结果 JSON 会在 `standard_answer_evidence` 中逐个记录 `dimension`、规范化 `id`、`raw_cell`、`keywords`、`standard_blank` 和原始行号；并包含：
+评分脚本的 schema v3 结果 JSON 会在 `standard_answer_evidence` 中逐个记录 `dimension`、规范化 `id`、`raw_cell`、`keywords`、`standard_blank`、标准答案OCR置信度和原始行号；并包含：
 
-- `run_status`：`complete` 或 `incomplete`；
+- `run_status`：`complete`、`incomplete`、`pending_review` 或 `output_failed`；
 - `summary`、`details`、`anomalies`：汇总、逐题明细和异常；
 - `evidence`：文档 revision、工作表、范围和内容哈希索引；
 - `failed_documents`：失败或等待续跑的文档；
+- `stopped_items`：每个未继续分支的阶段、对象、明确原因和下一步；
 - `cache_stats`：证据和学员评分片段的命中/未命中数；
 - `metadata.scoring_rule_version`、`standard_hash`、`profile_hash`、`aliases_hash`：增量评分依据。
 
 结果 JSON 是正式输出和后续渲染的唯一数据源。使用 `--result-json` 生成 PNG/Excel 时不再访问 Docs，不再评分。
+
+`source=image_ocr` 时，标准答案和作业的每个有效ID都必须在 `confidence` 中有对应的0–1有限数值。键按题目ID同规则规范化；缺失、布尔值、字符串、NaN、Infinity、越界、重复或无法对齐均不得静默计分，必须进入待复核或在API边界明确停止。
 
 ## 缓存键与续跑状态
 

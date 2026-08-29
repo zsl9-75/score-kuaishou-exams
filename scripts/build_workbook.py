@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -26,12 +27,15 @@ SCORE_COLORS = [
     ("between", ["0.6", "0.699999999"], "F5A05C", "25324B"),
     ("lessThan", ["0.6"], "F35161", "FFFFFF"),
 ]
+ILLEGAL_XML_CONTROL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def safe_excel_value(value: Any) -> Any:
     """Prevent user-controlled text from becoming an Excel formula."""
-    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
-        return "'" + value
+    if isinstance(value, str):
+        value = ILLEGAL_XML_CONTROL.sub("�", value)
+        if value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
     return value
 
 
@@ -144,7 +148,7 @@ def build_summary(ws, data: dict[str, Any]) -> None:
 
 
 def build_details(ws, data: dict[str, Any]) -> None:
-    append_safe(ws, ["同学", "维度", "ID", "标准答案原文", "作业答案原文", "标准关键词", "命中关键词", "结果", "来源", "OCR置信度", "备注"])
+    append_safe(ws, ["同学", "维度", "ID", "标准答案原文", "作业答案原文", "标准关键词", "命中关键词", "结果", "来源", "标准答案OCR置信度", "作业OCR置信度", "备注"])
     for item in data.get("details", []):
         append_safe(
             ws,
@@ -158,14 +162,16 @@ def build_details(ws, data: dict[str, Any]) -> None:
                 item.get("matched_keywords", item.get("homework_canonical", "")),
                 item.get("result", ""),
                 item.get("source", ""),
+                item.get("standard_confidence", ""),
                 item.get("confidence", ""),
                 item.get("note", ""),
             ]
         )
-    style_sheet(ws, [16, 24, 10, 24, 24, 20, 20, 12, 14, 12, 42])
-    for cell in ws["J"][1:]:
-        if isinstance(cell.value, (int, float)):
-            cell.number_format = "0.000"
+    style_sheet(ws, [16, 24, 10, 24, 24, 20, 20, 12, 14, 16, 16, 42])
+    for column in ("J", "K"):
+        for cell in ws[column][1:]:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "0.000"
 
 
 def build_anomalies(ws, data: dict[str, Any]) -> None:
