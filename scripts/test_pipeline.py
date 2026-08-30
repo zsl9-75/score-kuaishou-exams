@@ -28,6 +28,13 @@ pipeline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pipeline
 SPEC.loader.exec_module(pipeline)
 
+COMPOSE_PATH = Path(__file__).with_name("compose_score_images.py")
+COMPOSE_SPEC = importlib.util.spec_from_file_location("score_image_composer", COMPOSE_PATH)
+assert COMPOSE_SPEC and COMPOSE_SPEC.loader
+composer = importlib.util.module_from_spec(COMPOSE_SPEC)
+sys.modules[COMPOSE_SPEC.name] = composer
+COMPOSE_SPEC.loader.exec_module(composer)
+
 
 def document(headers, rows, *, student_name="", source="docs", document_id="test", revision="r1"):
     payload = {
@@ -108,6 +115,141 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(profiles["final-image-to-video"]["dimensions"]), 11)
         self.assertEqual(profiles["retake-text-to-video"]["dimensions"], profiles["final-text-to-video"]["dimensions"])
         self.assertEqual(profiles["retake-image-to-video"]["dimensions"], profiles["final-image-to-video"]["dimensions"])
+
+    def test_score_image_composition_uses_dynamic_union_and_assessment_sections(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            text_image = root / "文生.png"
+            image_image = root / "图生.png"
+            text_image.touch()
+            image_image.touch()
+            payload = {
+                "schema_version": 1,
+                "title": "28组补考文生与图生成绩汇总",
+                "group": "28组",
+                "progress": "补考",
+                "sources": [
+                    {
+                        "image": str(text_image), "label": "文生", "dimensions": ["基础画质", "动态美学"],
+                        "rows": [
+                            {"student": "李妍", "scores": {"基础画质": "87.5%", "动态美学": "62.5%"}, "overall": "74.00%"},
+                            {"student": "杜云飞", "scores": {"基础画质": "80%", "动态美学": "37.5%"}, "overall": "58.75%"},
+                        ],
+                    },
+                    {
+                        "image": str(image_image), "label": "图生", "dimensions": ["基础画质", "动态美学", "输入图一致性"],
+                        "rows": [
+                            {"student": "李妍", "scores": {"基础画质": "80%", "动态美学": "60%", "输入图一致性": "12.5%"}, "overall": "50.83%"},
+                            {"student": "杜云飞", "scores": {"基础画质": "70%", "动态美学": "60%", "输入图一致性": "87.5%"}, "overall": "72.50%"},
+                        ],
+                    },
+                ],
+            }
+            model = composer.build_model(payload)
+            self.assertEqual(model["dimensions"], ["基础画质", "动态美学", "输入图一致性"])
+            self.assertEqual([row["category"] for row in model["rows"]], ["文生", "文生", "图生", "图生"])
+            self.assertEqual([composer.percent_text(value) for value in model["rows"][0]["values"]], ["87.5%", "62.5%", "／"])
+            self.assertEqual(composer.percent_text(model["rows"][0]["overall"]), "74.00%")
+            self.assertEqual([composer.percent_text(value) for value in model["rows"][2]["values"]], ["80%", "60%", "12.5%"])
+            self.assertEqual(composer.percent_text(model["rows"][3]["overall"]), "72.50%")
+            output = root / "result.png"
+            details = composer.render_png(model, output)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(details["row_count"], 4)
+            self.assertEqual(details["missing_cells"], 2)
+
+    def test_score_image_composition_appends_named_metric_by_student(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            base_image = root / "文生.png"
+            metric_image = root / "动态美学.png"
+            base_image.touch()
+            metric_image.touch()
+            payload = {
+                "schema_version": 1,
+                "title": "动态美学并入文生",
+                "group": "29组",
+                "progress": "结业",
+                "sources": [
+                    {
+                        "image": str(base_image), "label": "文生", "dimensions": ["基础画质"],
+                        "rows": [
+                            {"student": "甲", "scores": {"基础画质": "80%"}, "overall": "80%"},
+                            {"student": "乙", "scores": {"基础画质": "60%"}, "overall": "60%"},
+                        ],
+                    },
+                    {
+                        "image": str(metric_image), "label": "美学", "dimensions": ["动态美学准确率"],
+                        "rows": [
+                            {"student": "乙", "scores": {"动态美学准确率": "37.5%"}, "overall": "37.5%"},
+                            {"student": "甲", "scores": {"动态美学准确率": "87.5%"}, "overall": "87.5%"},
+                        ],
+                    },
+                ],
+                "append_metrics": [{
+                    "source_label": "美学", "dimension": "动态美学准确率",
+                    "target_label": "文生", "output_label": "动态美学准确率",
+                }],
+            }
+            model = composer.build_model(payload)
+            self.assertEqual([row["category"] for row in model["rows"]], ["文生", "文生"])
+            self.assertEqual(model["supplement_labels"], ["动态美学准确率"])
+            self.assertEqual(
+                [[composer.percent_text(value) for value in row["supplements"]] for row in model["rows"]],
+                [["87.5%"], ["37.5%"]],
+            )
+
+    def test_score_image_composition_stops_on_cross_image_identity_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            first = root / "文生.png"
+            second = root / "图生.png"
+            first.touch()
+            second.touch()
+            payload = {
+                "schema_version": 1, "title": "姓名冲突", "group": "28组", "progress": "补考",
+                "sources": [
+                    {"image": str(first), "label": "文生", "dimensions": ["维度A"], "rows": [
+                        {"student": "甲", "scores": {"维度A": "80%"}, "overall": "80%"},
+                    ]},
+                    {"image": str(second), "label": "图生", "dimensions": ["维度A"], "rows": [
+                        {"student": "乙", "scores": {"维度A": "80%"}, "overall": "80%"},
+                    ]},
+                ],
+            }
+            with self.assertRaisesRegex(composer.CompositionError, "跨考核姓名未对齐"):
+                composer.build_model(payload)
+
+    def test_score_image_composition_rejects_unconfirmed_declared_score(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            source_image = Path(temp_name) / "待复核.png"
+            source_image.touch()
+            payload = {
+                "schema_version": 1, "title": "待复核成绩", "group": "28组", "progress": "补考",
+                "sources": [{
+                    "image": str(source_image), "label": "文生", "dimensions": ["维度A"],
+                    "rows": [{"student": "甲", "scores": {"维度A": None}, "overall": "80%"}],
+                }],
+            }
+            with self.assertRaisesRegex(composer.CompositionError, "缺少百分比"):
+                composer.build_model(payload)
+
+    def test_score_image_composition_cli_reports_stopped_without_partial_png(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            composition_path = root / "composition.json"
+            output = root / "result.png"
+            write_json(composition_path, {"schema_version": 1, "title": "无来源", "sources": []})
+            completed = subprocess.run(
+                [sys.executable, str(COMPOSE_PATH), "--composition-json", str(composition_path), "--output", str(output)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            report = json.loads(completed.stderr.strip().splitlines()[-1])
+            self.assertEqual(report["status"], "stopped")
+            self.assertEqual(report["stopped_items"][0]["stage"], "image_composition")
+            self.assertFalse(output.exists())
 
     def test_id_normalization(self):
         self.assertEqual(pipeline.normalize_id(" 0046 "), "46")
@@ -1948,10 +2090,10 @@ class PipelineTests(unittest.TestCase):
             shutil.copy2(project_root / "SKILL.md", flat / "SKILL.md")
             shutil.copy2(project_root / "requirements.txt", flat / "requirements.txt")
             shutil.copy2(source("agents/openai.yaml", "openai.yaml"), flat / "openai.yaml")
-            for name in ("exam_profiles.json", "evidence-schema.md", "manifest.md"):
+            for name in ("exam_profiles.json", "evidence-schema.md", "image-composition.md", "manifest.md"):
                 shutil.copy2(source(f"references/{name}", name), flat / name)
             for name in (
-                "run_assessment.py", "manifest_runtime.py", "build_workbook.py", "ocr_api.py",
+                "compose_score_images.py", "run_assessment.py", "manifest_runtime.py", "build_workbook.py", "ocr_api.py",
                 "ocr_vision.swift", "package_skill.py", "test_pipeline.py",
             ):
                 shutil.copy2(source(f"scripts/{name}", name), flat / name)

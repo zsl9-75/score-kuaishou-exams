@@ -1,4 +1,4 @@
 interface:
   display_name: "快手考试准确率"
-  short_description: "Docs或截图考试的ID/表头匹配、缓存续跑与Excel/色阶图"
-  default_prompt: "使用 $score-kuaishou-exams 通过统一 workflow 批改快手考试并写入明确的绝对交付目录。只要还有可执行动作或 recoverable=true 就自动继续，不猜测底层子命令；自动恢复耗尽后一次性说明所有未继续项的原因和下一步。若非特殊维度出现标准空值，保留证据、暂停评分并询问我选择审核标准答案或继续逐格排除。"
+  short_description: "Docs或截图考试批改、缓存续跑及已有成绩图动态合并排版"
+  default_prompt: "使用 $score-kuaishou-exams 处理快手考试成绩。先根据输入分流：已有成绩图片合并时只提取原图数据并动态排版，不重新评分；标准答案与作业批改时通过统一 workflow 执行。写入明确的绝对交付目录，只要还有可执行动作或 recoverable=true 就自动继续；自动恢复耗尽后一次性说明所有未继续项的原因和下一步。"

@@ -1,6 +1,6 @@
 ---
 name: score-kuaishou-exams
-description: 核对快手考试、补考和小考准确率，按固定维度与ID比较标准答案和学员作业。支持Docs结构化证据、截图标准答案与截图作业、Mac Vision或并发视觉API OCR、同一考核范围学习复用、缓存续跑、多关键词双向包含匹配，并生成正式JSON及可选Excel和色阶PNG。
+description: 核对快手考试、补考和小考准确率，按固定维度与ID比较标准答案和学员作业，并把已有成绩图片按动态维度拆解、合并和重新排版。支持Docs结构化证据、截图标准答案与截图作业、成绩图重排、缓存续跑、多关键词双向包含匹配，以及正式JSON、Excel和色阶PNG输出。
 ---
 
 # 快手考试准确率
@@ -11,10 +11,29 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 
 ## 入口分流
 
-1. 用户只要从已有正式JSON生成Excel或PNG时，直接执行 `--result-json`；不访问Docs，不重新评分。
-2. 存在原Manifest时复用原 `task_id`，走revision增量路径。只读revision变化、上次失败或未完成的文档。
-3. 截图考试使用 `screenshot-*` 配置；一次性运行可直接走 `--standard-images + --images`，需要固定输入与OCR配置时也可使用截图Manifest。
-4. 只有首次处理本次Docs考核时走完整取数路径。从用户请求确定考试配置、组别和进度，只使用 [exam_profiles.json](references/exam_profiles.json) 声明的维度。
+1. 用户提供的是已经生成好的成绩图片，并要求合并、拆解或优化排版时，走“已有成绩图片合并”模式；不访问标准答案、不重新评分、不调用原PNG渲染器。
+2. 用户只要从已有正式JSON生成Excel或PNG时，直接执行 `--result-json`；不访问Docs，不重新评分。
+3. 存在原Manifest时复用原 `task_id`，走revision增量路径。只读revision变化、上次失败或未完成的文档。
+4. 截图考试使用 `screenshot-*` 配置；一次性运行可直接走 `--standard-images + --images`，需要固定输入与OCR配置时也可使用截图Manifest。
+5. 只有首次处理本次Docs考核时走完整取数路径。从用户请求确定考试配置、组别和进度，只使用 [exam_profiles.json](references/exam_profiles.json) 声明的维度。
+
+## 已有成绩图片合并
+
+该模式的输入是已经包含姓名、维度和准确率的成绩图，不是标准答案或学员作业截图。完整数据契约和排版规则见 [image-composition.md](references/image-composition.md)。
+
+1. 逐图识别并回看确认考核类型、组别、进度、原始维度顺序、姓名、各维度百分比和源图总准确率；不要让用户手工重述图片里可直接读取的维度。
+2. 把确认后的数据写入临时composition JSON。只规范化表头空格和换行；不写死文生10维或图生11维，不改名、不重新计算成绩。
+3. 多个多维来源默认求维度并集，并按“文生、图生、其他考核类型”分区。来源整体缺少的维度显示灰底`／`，不视为0分。
+4. 用户明确点名补充指标时，使用`append_metrics`按组别和姓名追加为列；身份、表头或数值冲突时停止，禁止静默猜测。
+5. 使用独立脚本生成PNG；该命令不读取或修改原图，也不进入Manifest评分流程：
+
+```bash
+python3 scripts/compose_score_images.py \
+  --composition-json /absolute/temp/compose.json \
+  --output /absolute/delivery/合并成绩图.png
+```
+
+只在CLI返回`status=complete`后交付`png`绝对路径。`status=stopped`时必须转述全部`stopped_items`；不得回退到临时手写绘图脚本。
 
 ## Manifest主流程
 
