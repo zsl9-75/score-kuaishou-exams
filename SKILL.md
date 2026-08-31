@@ -22,10 +22,11 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 该模式的输入是已经包含姓名、维度和准确率的成绩图，不是标准答案或学员作业截图。完整数据契约和排版规则见 [image-composition.md](references/image-composition.md)。
 
 1. 逐图识别并回看确认考核类型、组别、进度、原始维度顺序、姓名、各维度百分比和源图总准确率；不要让用户手工重述图片里可直接读取的维度。
-2. 把确认后的数据写入临时composition JSON。只规范化表头空格和换行；不写死文生10维或图生11维，不改名、不重新计算成绩。
-3. 多个多维来源默认求维度并集，并按“文生、图生、其他考核类型”分区。来源整体缺少的维度显示灰底`／`，不视为0分。
-4. 用户明确点名补充指标时，使用`append_metrics`按组别和姓名追加为列；身份、表头或数值冲突时停止，禁止静默猜测。
-5. 使用独立脚本生成PNG；该命令不读取或修改原图，也不进入Manifest评分流程：
+2. 把确认后的数据写入临时composition JSON。只规范化表头空格和换行；不写死组名或维度数，不改名、不重新计算成绩。
+3. 以考试结构而非组数选择版式：单组和同结构多组都按“考核类型 → 组别 → 学员”排列；不同结构自动分图。结构签名、分图规则和异常边界见 [image-composition.md](references/image-composition.md)。
+4. 同一结构内按“文生、图生、其他考核类型”分区并求维度并集。某考核类型不适用的维度显示灰底`／`，不视为0分或识别失败。
+5. 用户明确点名补充指标时，使用`append_metrics`按`group + student`追加到目标考核区；来源区默认隐藏，非目标考核区显示`／`。身份、表头或数值冲突时停止，禁止静默猜测。
+6. 使用独立脚本生成PNG；该命令不读取或修改原图，也不进入Manifest评分流程。已确认只有一种结构时可指定单图：
 
 ```bash
 python3 scripts/compose_score_images.py \
@@ -33,11 +34,19 @@ python3 scripts/compose_score_images.py \
   --output /absolute/delivery/合并成绩图.png
 ```
 
-只在CLI返回`status=complete`后交付`png`绝对路径。`status=stopped`时必须转述全部`stopped_items`；不得回退到临时手写绘图脚本。
+多组或结构尚未确定时使用自动分图：
+
+```bash
+python3 scripts/compose_score_images.py \
+  --composition-json /absolute/temp/compose.json \
+  --output-dir /absolute/delivery/优化后
+```
+
+只在CLI返回`status=complete`后交付`pngs[].path`绝对路径；单图模式仍可使用`png`。`status=stopped`时必须转述全部`stopped_items`；不得回退到临时手写绘图脚本。
 
 ## Manifest主流程
 
-1. 创建或更新 [Manifest](references/manifest.md)。一次考核始终复用同一 `task_id`；不同考核使用新 `task_id`，禁止跨考核复用作业范围。
+1. 创建或更新 [Manifest](references/manifest.md)。一次考核始终复用同一 `task_id`；换组、换考试配置、换场次或换标准答案时使用新 `task_id`。运行时会把组别、`exam_profile`、`progress`、标准答案来源和作业来源绑定为 Manifest 身份指纹；同一 `task_id` 的指纹变化时立即停止，`--refresh` 不能覆盖该保护。
 2. 每个安装首次运行可执行机器可读能力检查；不要猜测子命令：
 
 ```bash
@@ -85,13 +94,14 @@ python3 scripts/manifest_runtime.py workflow \
 
 6. 权限、不存在或身份冲突只隔离对应文档；所有其他可处理文档继续。最终只保存 `incomplete` JSON检查点，禁止生成正式Excel/PNG。
 
-`workflow --refresh` 开始新一轮全量权限/revision预检，但保留已成功证据缓存；同revision文档预检后直接命中缓存，只重读变化或上轮失败的项。无 revision 的文档每次重读，再以内容哈希判断是否需要重新评分。缓存和续跑状态保存在 Manifest 旁的 `.score-cache`，不对用户交付，也不放入 Skill ZIP。底层 `specs/plan/ingest/fail` 仅作兼容和调试，不得再用于默认Agent流程。
+`workflow --refresh` 开始新一轮全量权限/revision预检，但保留已成功证据缓存；同revision文档预检后直接命中缓存，只重读变化或上轮失败的项。无 revision 的文档每次重读，再以内容哈希判断是否需要重新评分。缓存和续跑状态保存在 Manifest 旁的 `.score-cache`，不对用户交付，也不提交到 Skill 仓库。底层 `specs/plan/ingest/fail` 仅作兼容和调试，不得再用于默认Agent流程。
 
 ## Docs 读取约束
 
 - 在标准答案和作业表中，自动寻找同时包含受支持的题目ID表头（如 `ID`/`order`）和规定维度的工作表。唯一候选自动选择；多个候选时停止并请用户确认。
 - 在索引表中只读姓名列和作业链接列。一份多人文档或多份个人文档都可使用。
 - 只读文档，不编辑内容、权限或分享设置。Docs 能力不可用时停止，不退化为网页截图 OCR。
+- Docs 省略行末空单元格时，证据边界按表头长度补齐 `null` 后再缓存和评分；行列数超过表头时明确停止。
 - 每次读取保存来源链接、文档 ID、revision、工作表、范围、原始单元格、读取时间和内容哈希，格式见 [evidence-schema.md](references/evidence-schema.md)。
 
 ## 截图考试

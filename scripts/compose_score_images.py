@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -247,16 +248,22 @@ def merge_categories(sources: list[Source]) -> OrderedDict[str, Category]:
     return categories
 
 
-def ordered_keys(payload: dict[str, Any], categories: OrderedDict[str, Category]) -> list[str]:
+def ordered_keys(
+    payload: dict[str, Any],
+    categories: OrderedDict[str, Category],
+    *,
+    allow_missing: bool = False,
+) -> list[str]:
     raw_order = payload.get("category_order")
     if raw_order is not None:
         if not isinstance(raw_order, list) or len({compact_text(value) for value in raw_order}) != len(raw_order):
             raise CompositionError("category_order必须是无重复数组")
         requested = [compact_text(value) for value in raw_order]
         unknown = [value for value in requested if value not in categories]
-        if unknown:
+        if unknown and not allow_missing:
             raise CompositionError(f"category_order包含未知考核类型：{unknown}")
-        return requested + [key for key in categories if key not in requested]
+        present = [value for value in requested if value in categories]
+        return present + [key for key in categories if key not in present]
 
     def priority(key: str) -> tuple[int, int]:
         if "文生" in key:
@@ -287,24 +294,45 @@ def category_identity(category: Category, group_key: str) -> set[str]:
     return {row.student for (group, _), row in category.rows.items() if group == group_key}
 
 
-def build_model(payload: dict[str, Any]) -> dict[str, Any]:
-    title = display_text(payload.get("title"), "title")
-    root_group = str(payload.get("group") or "").strip()
-    root_progress = str(payload.get("progress") or "").strip()
-    layout = str(payload.get("layout") or "auto").strip()
-    if layout not in {"auto", "stack_by_assessment"}:
-        raise CompositionError("layout只支持auto或stack_by_assessment")
-    raw_sources = payload.get("sources")
-    if not isinstance(raw_sources, list) or not raw_sources:
-        raise CompositionError("sources必须是非空数组")
-    sources = [load_source(raw, index, root_group, root_progress) for index, raw in enumerate(raw_sources)]
-    categories = merge_categories(sources)
-    category_keys = ordered_keys(payload, categories)
-    group_keys = first_seen_groups(sources, payload.get("group_order"))
-
+def validate_append_references(payload: dict[str, Any], categories: OrderedDict[str, Category]) -> None:
     raw_appends = payload.get("append_metrics") or []
     if not isinstance(raw_appends, list):
         raise CompositionError("append_metrics必须是数组")
+    output_keys: set[str] = set()
+    for index, raw in enumerate(raw_appends):
+        if not isinstance(raw, dict):
+            raise CompositionError(f"append_metrics[{index}]必须是对象")
+        source_key = compact_text(raw.get("source_label"))
+        target_key = compact_text(raw.get("target_label"))
+        dimension_key = compact_text(raw.get("dimension"))
+        output_label = display_text(raw.get("output_label") or raw.get("dimension"), f"append_metrics[{index}].output_label")
+        output_key = compact_text(output_label)
+        if source_key not in categories or target_key not in categories:
+            raise CompositionError(f"append_metrics[{index}]引用了未知考核类型")
+        if source_key == target_key:
+            raise CompositionError(f"append_metrics[{index}]来源与目标不能相同")
+        if dimension_key not in categories[source_key].dimension_labels:
+            raise CompositionError(f"append_metrics[{index}]找不到来源维度：{raw.get('dimension')}")
+        if output_key in output_keys:
+            raise CompositionError(f"append_metrics输出列重复：{output_label}")
+        output_keys.add(output_key)
+
+
+def structure_digest(structure: dict[str, Any]) -> str:
+    encoded = json.dumps(structure, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def _build_model_from_sources(
+    payload: dict[str, Any],
+    sources: list[Source],
+    group_keys: list[str],
+) -> dict[str, Any]:
+    title = display_text(payload.get("title"), "title")
+    categories = merge_categories(sources)
+    category_keys = ordered_keys(payload, categories, allow_missing=True)
+
+    raw_appends = payload.get("append_metrics") or []
     supplements: list[dict[str, Any]] = []
     consumed: set[str] = set()
     supplement_values: dict[tuple[str, str, str, str], PercentValue] = {}
@@ -318,13 +346,11 @@ def build_model(payload: dict[str, Any]) -> dict[str, Any]:
         output_label = display_text(raw.get("output_label") or raw.get("dimension"), f"append_metrics[{index}].output_label")
         output_key = compact_text(output_label)
         if source_key not in categories or target_key not in categories:
-            raise CompositionError(f"append_metrics[{index}]引用了未知考核类型")
-        if source_key == target_key:
-            raise CompositionError(f"append_metrics[{index}]来源与目标不能相同")
+            continue
         source_category = categories[source_key]
         target_category = categories[target_key]
         if dimension_key not in source_category.dimension_labels:
-            raise CompositionError(f"append_metrics[{index}]找不到来源维度：{raw.get('dimension')}")
+            continue
         if output_key in supplement_labels:
             raise CompositionError(f"append_metrics输出列重复：{output_label}")
         supplement_labels.add(output_key)
@@ -344,7 +370,13 @@ def build_model(payload: dict[str, Any]) -> dict[str, Any]:
         keep_source = bool(raw.get("keep_source", False))
         if not keep_source:
             consumed.add(source_key)
-        supplements.append({"target_key": target_key, "key": output_key, "label": output_label})
+        supplements.append({
+            "source_key": source_key,
+            "target_key": target_key,
+            "dimension_key": dimension_key,
+            "key": output_key,
+            "label": output_label,
+        })
 
     rendered_keys = [key for key in category_keys if key not in consumed]
     if not rendered_keys:
@@ -376,12 +408,20 @@ def build_model(payload: dict[str, Any]) -> dict[str, Any]:
     if collisions:
         raise CompositionError(f"追加指标与已有维度重名：{collisions}")
 
+    canonical_order: dict[str, list[str]] = {}
+    anchor_category = categories[rendered_keys[0]]
+    for group_key in group_keys:
+        anchor_rows = [row for (group, _), row in anchor_category.rows.items() if group == group_key]
+        anchor_rows.sort(key=lambda item: item.row_order)
+        canonical_order[group_key] = [row.student for row in anchor_rows]
+
     rows: list[dict[str, Any]] = []
     for category_key in rendered_keys:
         category = categories[category_key]
         for group_key in group_keys:
             group_rows = [row for (group, _), row in category.rows.items() if group == group_key]
-            group_rows.sort(key=lambda item: item.row_order)
+            order = {student: index for index, student in enumerate(canonical_order[group_key])}
+            group_rows.sort(key=lambda item: order[item.student])
             for row in group_rows:
                 values = [row.scores.get(dimension) for dimension in global_dimensions]
                 appended = [
@@ -399,13 +439,83 @@ def build_model(payload: dict[str, Any]) -> dict[str, Any]:
                     "supplements": appended,
                 })
     summary_label = display_text(payload.get("summary_label") or "总准确率", "summary_label")
+    structure = {
+        "categories": [
+            {
+                "label": key,
+                "dimensions": categories[key].dimensions,
+            }
+            for key in rendered_keys
+        ],
+        "summary_label": compact_text(summary_label),
+        "supplements": [
+            {
+                "source": item["source_key"],
+                "target": item["target_key"],
+                "dimension": item["dimension_key"],
+                "output": item["key"],
+            }
+            for item in supplements
+        ],
+    }
+    signature = structure_digest(structure)
+    group_labels: list[str] = []
+    for group_key in group_keys:
+        matching = next((source.group for source in sources if compact_text(source.group) == group_key), group_key)
+        group_labels.append(matching)
     return {
         "title": title,
         "dimensions": [dimension_labels[key] for key in global_dimensions],
         "summary_label": summary_label,
         "supplement_labels": [item["label"] for item in supplements],
         "rows": rows,
+        "groups": group_labels,
+        "structure": structure,
+        "structure_signature": signature,
     }
+
+
+def build_models(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    display_text(payload.get("title"), "title")
+    layout = str(payload.get("layout") or "auto").strip()
+    if layout not in {"auto", "stack_by_assessment"}:
+        raise CompositionError("layout只支持auto或stack_by_assessment")
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise CompositionError("sources必须是非空数组")
+    root_group = str(payload.get("group") or "").strip()
+    root_progress = str(payload.get("progress") or "").strip()
+    sources = [load_source(raw, index, root_group, root_progress) for index, raw in enumerate(raw_sources)]
+    all_categories = merge_categories(sources)
+    ordered_keys(payload, all_categories)
+    validate_append_references(payload, all_categories)
+    group_keys = first_seen_groups(sources, payload.get("group_order"))
+
+    buckets: OrderedDict[str, list[str]] = OrderedDict()
+    for group_key in group_keys:
+        group_sources = [source for source in sources if compact_text(source.group) == group_key]
+        model = _build_model_from_sources(payload, group_sources, [group_key])
+        buckets.setdefault(model["structure_signature"], []).append(group_key)
+
+    if layout == "stack_by_assessment" and len(buckets) > 1:
+        raise CompositionError("显式stack_by_assessment要求所有组的考试结构一致")
+
+    models: list[dict[str, Any]] = []
+    for signature, bucket_groups in buckets.items():
+        bucket_sources = [source for source in sources if compact_text(source.group) in set(bucket_groups)]
+        model = _build_model_from_sources(payload, bucket_sources, bucket_groups)
+        if model["structure_signature"] != signature:
+            raise CompositionError("自动分组后考试结构不稳定，请复核考核类型与维度")
+        models.append(model)
+    return models
+
+
+def build_model(payload: dict[str, Any]) -> dict[str, Any]:
+    models = build_models(payload)
+    if len(models) != 1:
+        details = [f"{','.join(model['groups'])}:{model['structure_signature']}" for model in models]
+        raise CompositionError(f"检测到多种考试结构，请使用--output-dir自动分图：{details}")
+    return models[0]
 
 
 def find_font(size: int, bold: bool = False):
@@ -568,11 +678,20 @@ def render_png(model: dict[str, Any], output: Path) -> dict[str, Any]:
         left += width_value
     for index in range(1, len(rows)):
         group_changed = rows[index]["group"] != rows[index - 1]["group"]
+        progress_changed = rows[index]["progress"] != rows[index - 1]["progress"]
         category_changed = rows[index]["category"] != rows[index - 1]["category"]
-        if group_changed or category_changed:
+        if group_changed or progress_changed or category_changed:
             y = body_top + index * row_height
-            line_left = margin if group_changed else margin + widths[0] + widths[1]
-            draw.line((line_left, y, margin + table_width, y), fill=COLORS["divider"], width=3)
+            left = margin
+            for changed, segment_width in zip(
+                (group_changed, progress_changed, category_changed),
+                widths[:3],
+            ):
+                if changed:
+                    draw.line((left, y, left + segment_width, y), fill=COLORS["divider"], width=3)
+                left += segment_width
+            name_left = margin + sum(widths[:3])
+            draw.line((name_left, y, margin + table_width, y), fill=COLORS["divider"], width=3)
 
     legend_top = table_top + table_height + 20
     draw.rounded_rectangle((margin, legend_top, margin + table_width, legend_top + legend_height), radius=12, fill="#F8FAFD", outline="#DCE2EA", width=2)
@@ -594,17 +713,72 @@ def render_png(model: dict[str, Any], output: Path) -> dict[str, Any]:
     return {"width": width, "height": height, "row_count": len(rows), "missing_cells": missing_cells}
 
 
+def safe_filename_part(value: str, *, fallback: str) -> str:
+    text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "-", str(value).strip())
+    text = re.sub(r"\s+", "", text).strip(".-")
+    return (text or fallback)[:120]
+
+
+def output_name(model: dict[str, Any], *, split: bool) -> str:
+    title = safe_filename_part(model["title"], fallback="成绩汇总")
+    if not split:
+        return f"{title}.png"
+    groups = safe_filename_part("-".join(model["groups"]), fallback="未分组")
+    return f"{title}-{groups}-{model['structure_signature'][:8]}.png"
+
+
+def output_record(model: dict[str, Any], path: Path, details: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(path.resolve()),
+        "groups": model["groups"],
+        "structure_signature": model["structure_signature"],
+        **details,
+    }
+
+
+def commit_staged_files(staged: list[tuple[Path, Path]], backup_root: Path) -> None:
+    backup_root.mkdir(parents=True, exist_ok=True)
+    committed: list[tuple[Path, Path | None]] = []
+    try:
+        for index, (staged_path, target) in enumerate(staged):
+            if target.is_dir():
+                raise CompositionError(f"输出文件与已有目录冲突：{target}")
+            backup: Path | None = None
+            if target.exists():
+                backup = backup_root / f"{index:03d}-{target.name}"
+                os.replace(target, backup)
+            try:
+                os.replace(staged_path, target)
+            except OSError:
+                if backup is not None and backup.exists():
+                    os.replace(backup, target)
+                raise
+            committed.append((target, backup))
+    except (CompositionError, OSError):
+        for target, backup in reversed(committed):
+            if target.exists() and target.is_file():
+                target.unlink()
+            if backup is not None and backup.exists():
+                os.replace(backup, target)
+        raise
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = CompositionArgumentParser(description="从已提取的成绩图片数据生成动态维度合并色阶图")
     parser.add_argument("--composition-json", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--output", type=Path)
+    destination.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
     if not args.composition_json.is_absolute():
         raise CompositionError("--composition-json必须是绝对路径")
-    if not args.output.is_absolute():
-        raise CompositionError("--output必须是绝对路径")
-    if args.output.suffix.lower() != ".png":
-        raise CompositionError("--output必须以.png结尾")
+    if args.output is not None:
+        if not args.output.is_absolute():
+            raise CompositionError("--output必须是绝对路径")
+        if args.output.suffix.lower() != ".png":
+            raise CompositionError("--output必须以.png结尾")
+    if args.output_dir is not None and not args.output_dir.is_absolute():
+        raise CompositionError("--output-dir必须是绝对路径")
     return args
 
 
@@ -612,6 +786,7 @@ def stopped_payload(reason: str) -> dict[str, Any]:
     return {
         "status": "stopped",
         "png": None,
+        "pngs": [],
         "stopped_items": [{
             "stage": "image_composition",
             "reason": reason,
@@ -624,14 +799,45 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
         payload = load_payload(args.composition_json)
-        model = build_model(payload)
-        details = render_png(model, args.output)
+        models = build_models(payload)
+        if args.output is not None:
+            if len(models) != 1:
+                details = [f"{','.join(model['groups'])}:{model['structure_signature']}" for model in models]
+                raise CompositionError(f"检测到多种考试结构，请使用--output-dir自动分图：{details}")
+            model = models[0]
+            details = render_png(model, args.output)
+            record = output_record(model, args.output, details)
+            print(json.dumps({
+                "status": "complete",
+                "png": str(args.output.resolve()),
+                "pngs": [record],
+                "dimensions": model["dimensions"],
+                "supplemental_columns": model["supplement_labels"],
+                **details,
+            }, ensure_ascii=False))
+            return 0
+
+        output_dir = args.output_dir
+        assert output_dir is not None
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        split = len(models) > 1
+        records: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix=".compose-batch-", dir=output_dir.parent) as temp_name:
+            stage_root = Path(temp_name)
+            staged: list[tuple[Path, Path]] = []
+            for model in models:
+                name = output_name(model, split=split)
+                staged_path = stage_root / name
+                target = output_dir / name
+                details = render_png(model, staged_path)
+                staged.append((staged_path, target))
+                records.append(output_record(model, target, details))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            commit_staged_files(staged, stage_root / "backups")
         print(json.dumps({
             "status": "complete",
-            "png": str(args.output.resolve()),
-            "dimensions": model["dimensions"],
-            "supplemental_columns": model["supplement_labels"],
-            **details,
+            "png": records[0]["path"] if len(records) == 1 else None,
+            "pngs": records,
         }, ensure_ascii=False))
         return 0
     except (CompositionError, OSError) as exc:

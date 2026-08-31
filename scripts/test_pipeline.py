@@ -10,7 +10,6 @@ import tempfile
 import threading
 import time
 import unittest
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +249,155 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report["status"], "stopped")
             self.assertEqual(report["stopped_items"][0]["stage"], "image_composition")
             self.assertFalse(output.exists())
+
+    def test_score_image_composition_combines_same_structure_groups_and_reorders_students(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = []
+            for group, students in (("29组", ["甲", "乙"]), ("30组", ["丙", "丁"])):
+                text_image = root / f"{group}-文生.png"
+                image_image = root / f"{group}-图生.png"
+                text_image.touch()
+                image_image.touch()
+                sources.extend([
+                    {
+                        "image": str(text_image), "label": "文生", "group": group, "progress": "结业",
+                        "dimensions": ["基础画质"],
+                        "rows": [
+                            {"student": student, "scores": {"基础画质": f"{80 + index * 10}%"}, "overall": f"{80 + index * 10}%"}
+                            for index, student in enumerate(students)
+                        ],
+                    },
+                    {
+                        "image": str(image_image), "label": "图生", "group": group, "progress": "结业",
+                        "dimensions": ["基础画质", "输入图一致性"],
+                        "rows": [
+                            {"student": student, "scores": {"基础画质": "75%", "输入图一致性": "62.5%"}, "overall": "68.75%"}
+                            for student in reversed(students)
+                        ],
+                    },
+                ])
+            payload = {"schema_version": 1, "title": "多组同结构", "sources": sources}
+            models = composer.build_models(payload)
+            self.assertEqual(len(models), 1)
+            model = models[0]
+            self.assertEqual(model["groups"], ["29组", "30组"])
+            self.assertEqual(
+                [(row["category"], row["group"], row["student"]) for row in model["rows"]],
+                [
+                    ("文生", "29组", "甲"), ("文生", "29组", "乙"),
+                    ("文生", "30组", "丙"), ("文生", "30组", "丁"),
+                    ("图生", "29组", "甲"), ("图生", "29组", "乙"),
+                    ("图生", "30组", "丙"), ("图生", "30组", "丁"),
+                ],
+            )
+            self.assertEqual(
+                [composer.percent_text(value) for value in model["rows"][4]["values"]],
+                ["75%", "62.5%"],
+            )
+
+    def test_score_image_composition_appends_two_aesthetic_metrics_only_to_text_section(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            paths = {label: root / f"{label}.png" for label in ("文生", "图生", "美学")}
+            for path in paths.values():
+                path.touch()
+            payload = {
+                "schema_version": 1, "title": "美学追加", "group": "29组", "progress": "结业",
+                "sources": [
+                    {"image": str(paths["文生"]), "label": "文生", "dimensions": ["基础画质"], "rows": [
+                        {"student": "甲", "scores": {"基础画质": "80%"}, "overall": "80%"},
+                    ]},
+                    {"image": str(paths["图生"]), "label": "图生", "dimensions": ["基础画质", "输入图一致性"], "rows": [
+                        {"student": "甲", "scores": {"基础画质": "75%", "输入图一致性": "62.5%"}, "overall": "68.75%"},
+                    ]},
+                    {"image": str(paths["美学"]), "label": "美学", "dimensions": ["画面美学", "动态美学"], "rows": [
+                        {"student": "甲", "scores": {"画面美学": "87.5%", "动态美学": "37.5%"}, "overall": "62.5%"},
+                    ]},
+                ],
+                "append_metrics": [
+                    {"source_label": "美学", "dimension": "画面美学", "target_label": "文生", "output_label": "画面美学准确率"},
+                    {"source_label": "美学", "dimension": "动态美学", "target_label": "文生", "output_label": "动态美学准确率"},
+                ],
+            }
+            model = composer.build_model(payload)
+            self.assertEqual([row["category"] for row in model["rows"]], ["文生", "图生"])
+            self.assertEqual(model["supplement_labels"], ["画面美学准确率", "动态美学准确率"])
+            self.assertEqual(
+                [[composer.percent_text(value) for value in row["supplements"]] for row in model["rows"]],
+                [["87.5%", "37.5%"], ["／", "／"]],
+            )
+
+    def test_score_image_composition_output_dir_splits_different_structures(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            first = root / "28组.png"
+            second = root / "29组.png"
+            first.touch()
+            second.touch()
+            payload = {
+                "schema_version": 1, "title": "自动分图", "sources": [
+                    {"image": str(first), "label": "文生", "group": "28组", "progress": "补考", "dimensions": ["维度A"], "rows": [
+                        {"student": "甲", "scores": {"维度A": "80%"}, "overall": "80%"},
+                    ]},
+                    {"image": str(second), "label": "文生", "group": "29组", "progress": "结业", "dimensions": ["维度A", "维度B"], "rows": [
+                        {"student": "乙", "scores": {"维度A": "62.5%", "维度B": "37.5%"}, "overall": "50.00%"},
+                    ]},
+                ],
+            }
+            composition = root / "composition.json"
+            output_dir = root / "outputs"
+            write_json(composition, payload)
+            completed = subprocess.run(
+                [sys.executable, str(COMPOSE_PATH), "--composition-json", str(composition), "--output-dir", str(output_dir)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            report = json.loads(completed.stdout.strip().splitlines()[-1])
+            self.assertEqual(report["status"], "complete")
+            self.assertIsNone(report["png"])
+            self.assertEqual(len(report["pngs"]), 2)
+            self.assertEqual([item["groups"] for item in report["pngs"]], [["28组"], ["29组"]])
+            self.assertEqual(len(list(output_dir.glob("*.png"))), 2)
+            for item in report["pngs"]:
+                self.assertEqual(Path(item["path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+            single_output = root / "should-not-exist.png"
+            stopped = subprocess.run(
+                [sys.executable, str(COMPOSE_PATH), "--composition-json", str(composition), "--output", str(single_output)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(stopped.returncode, 2)
+            stopped_report = json.loads(stopped.stderr.strip().splitlines()[-1])
+            self.assertIn("请使用--output-dir自动分图", stopped_report["stopped_items"][0]["reason"])
+            self.assertFalse(single_output.exists())
+
+    def test_score_image_composition_output_dir_leaves_no_png_when_validation_stops(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            first = root / "文生.png"
+            second = root / "图生.png"
+            first.touch()
+            second.touch()
+            composition = root / "composition.json"
+            output_dir = root / "outputs"
+            write_json(composition, {
+                "schema_version": 1, "title": "姓名冲突", "group": "28组", "progress": "补考", "sources": [
+                    {"image": str(first), "label": "文生", "dimensions": ["维度A"], "rows": [
+                        {"student": "甲", "scores": {"维度A": "80%"}, "overall": "80%"},
+                    ]},
+                    {"image": str(second), "label": "图生", "dimensions": ["维度A"], "rows": [
+                        {"student": "乙", "scores": {"维度A": "80%"}, "overall": "80%"},
+                    ]},
+                ],
+            })
+            completed = subprocess.run(
+                [sys.executable, str(COMPOSE_PATH), "--composition-json", str(composition), "--output-dir", str(output_dir)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertFalse(output_dir.exists())
+            self.assertEqual(list(root.rglob("outputs/*.png")), [])
 
     def test_id_normalization(self):
         self.assertEqual(pipeline.normalize_id(" 0046 "), "46")
@@ -954,6 +1102,109 @@ class PipelineTests(unittest.TestCase):
             write_json(path, payload)
             with self.assertRaisesRegex(runtime.ManifestError, "1–15"):
                 runtime.load_manifest(path)
+
+    def test_manifest_identity_blocks_task_id_reuse_across_group_exam_or_standard(self):
+        changes = {
+            "group": lambda payload: payload.update({"group": "30组"}),
+            "exam_profile": lambda payload: payload.update({"exam_profile": "retake-dynamic-aesthetic"}),
+            "progress": lambda payload: payload.update({"progress": "第二次补考动态美学"}),
+            "standard": lambda payload: payload.update({
+                "standard": {
+                    **payload["standard"],
+                    "id": "another-standard",
+                    "url": "https://docs.corp.kuaishou.com/another-standard",
+                },
+            }),
+            "homework_source": lambda payload: payload.update({
+                "homework": {
+                    "index": {
+                        "id": "group-29-index",
+                        "url": "https://docs.corp.kuaishou.com/group-29-index",
+                    },
+                },
+            }),
+        }
+        for label, mutate in changes.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_name:
+                temp = Path(temp_name)
+                manifest_path = temp / "task.json"
+                payload = manifest_payload()
+                write_json(manifest_path, payload)
+                manifest = runtime.load_manifest(manifest_path)
+                runtime.plan_reads(manifest, runtime.document_specs(manifest, runtime.load_state(manifest), stage="initial"))
+                mutate(payload)
+                write_json(manifest_path, payload)
+                changed = runtime.load_manifest(manifest_path)
+                with self.assertRaisesRegex(runtime.ManifestIdentityMismatch, "新的 task_id"):
+                    runtime.load_state(changed)
+
+    def test_manifest_identity_allows_same_assessment_runtime_revision_and_roster_updates(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            runtime.plan_reads(manifest, runtime.document_specs(manifest, runtime.load_state(manifest), stage="students"))
+            original_identity = runtime.load_state(manifest)["manifest_identity"]
+
+            payload["runtime"] = {"max_concurrency": 3, "retries": 4, "retry_delays_seconds": [0, 0, 0]}
+            payload["output"]["dir"] = "/tmp/another-delivery"
+            payload["standard"]["revision"] = "std-r2"
+            payload["homework"]["documents"] = payload["homework"]["documents"][:1]
+            write_json(manifest_path, payload)
+            changed = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(changed)
+            self.assertEqual(state["manifest_identity"], original_identity)
+            runtime.plan_reads(changed, runtime.document_specs(changed, state, stage="students"))
+
+    def test_legacy_checkpoint_binds_identity_once_but_rejects_different_standard(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            legacy_state = {
+                "schema_version": 2,
+                "task_id": manifest["task_id"],
+                "documents": {
+                    "old-standard": {"role": "standard", "document_id": "standard-doc", "status": "pending"},
+                },
+            }
+            runtime.state_path(manifest).parent.mkdir(parents=True, exist_ok=True)
+            write_json(runtime.state_path(manifest), legacy_state)
+            migrated = runtime.load_state(manifest)
+            self.assertRegex(migrated["manifest_identity"]["fingerprint"], r"^[0-9a-f]{64}$")
+            runtime.save_state(manifest, migrated)
+            self.assertIn("manifest_identity", json.loads(runtime.state_path(manifest).read_text(encoding="utf-8")))
+
+            migrated.pop("manifest_identity")
+            migrated["documents"]["old-standard"]["document_id"] = "other-standard"
+            write_json(runtime.state_path(manifest), migrated)
+            with self.assertRaisesRegex(runtime.ManifestIdentityMismatch, "旧检查点"):
+                runtime.load_state(manifest)
+
+    def test_manifest_identity_conflict_has_machine_readable_cli_stop(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            manifest_path = temp / "task.json"
+            payload = manifest_payload()
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            runtime.plan_reads(manifest, runtime.document_specs(manifest, runtime.load_state(manifest), stage="initial"))
+            payload["group"] = "30组"
+            write_json(manifest_path, payload)
+            completed = subprocess.run(
+                [sys.executable, str(Path(runtime.__file__)), "workflow", "--manifest", str(manifest_path), "--refresh"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            report = json.loads(completed.stderr.strip().splitlines()[-1])
+            self.assertEqual(report["error_code"], "manifest_identity_mismatch")
+            self.assertIn("新的 task_id", report["stopped_items"][0]["next_action"])
 
     def test_empty_url_does_not_create_fake_document_id(self):
         with self.assertRaisesRegex(runtime.ManifestError, "url 或 id"):
@@ -1990,6 +2241,56 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(pipeline.AssessmentError, "必须是数组"):
                 pipeline.load_evidence_files([object_row_path])
 
+    def test_short_evidence_rows_are_padded_at_every_load_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "short-row.json"
+            short = document(["同学名称", "ID", "画面美学"], [["张三", 1]], student_name="张三")
+            write_json(path, short)
+
+            manifest_loaded = runtime.load_evidence_payload(path)
+            direct_loaded = pipeline.load_evidence_files([path])[0]
+            self.assertEqual(manifest_loaded["rows"], [["张三", 1, None]])
+            self.assertEqual(direct_loaded["rows"], [["张三", 1, None]])
+            with self.assertRaisesRegex(runtime.ManifestError, "必须补为 null"):
+                runtime.validate_evidence_payload(short)
+
+    def test_short_rows_follow_existing_blank_scoring_rules_without_index_error(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            standard_path = temp / "standard.json"
+            homework_path = temp / "homework.json"
+            write_json(standard_path, document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard"))
+            write_json(
+                homework_path,
+                document(["同学名称", "ID", "画面美学"], [["张三", 1]], student_name="张三", document_id="homework"),
+            )
+            result = pipeline.build_scored_result(
+                profile_key="retake-image-aesthetic",
+                group="29组",
+                progress="短行作业",
+                standard_documents=pipeline.load_evidence_files([standard_path]),
+                homework_documents=pipeline.load_evidence_files([homework_path]),
+                aliases={},
+                source_mode="docs",
+            )
+            dimension = result["summary"][0]["dimensions"]["画面美学"]
+            self.assertEqual(result["run_status"], "complete")
+            self.assertEqual((dimension["correct"], dimension["total"], dimension["accuracy"]), (0, 1, 0.0))
+            self.assertEqual(dimension["wrong_ids"], ["1"])
+
+            write_json(standard_path, document(["ID", "画面美学"], [[1]], document_id="standard"))
+            waiting = pipeline.build_scored_result(
+                profile_key="retake-image-aesthetic",
+                group="29组",
+                progress="短行标准答案",
+                standard_documents=pipeline.load_evidence_files([standard_path]),
+                homework_documents=[document(["同学名称", "ID", "画面美学"], [["张三", 1, "都一般"]])],
+                aliases={},
+                source_mode="docs",
+            )
+            self.assertEqual(waiting["run_status"], "awaiting_standard_decision")
+            self.assertEqual(waiting["decision_request"]["affected_cells"][0]["id"], "1")
+
     def test_output_path_that_is_a_file_is_rejected_cleanly(self):
         with tempfile.TemporaryDirectory() as temp_name:
             temp = Path(temp_name)
@@ -2076,40 +2377,6 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(unknown_payload["status"], "stopped")
             self.assertIn("命令参数错误", unknown_payload["stopped_items"][0]["reason"])
             self.assertTrue(unknown_payload["stopped_items"][0]["next_action"])
-
-    def test_flat_layout_package_uses_skill_name_for_file_and_archive_root(self):
-        with tempfile.TemporaryDirectory() as temp_name:
-            flat = Path(temp_name)
-            script_location = Path(__file__).resolve().parent
-            project_root = script_location.parent if (script_location.parent / "SKILL.md").is_file() else script_location
-            standard_layout = (project_root / "scripts" / "run_assessment.py").is_file()
-
-            def source(standard_name, flat_name):
-                return project_root / (standard_name if standard_layout else flat_name)
-
-            shutil.copy2(project_root / "SKILL.md", flat / "SKILL.md")
-            shutil.copy2(project_root / "requirements.txt", flat / "requirements.txt")
-            shutil.copy2(source("agents/openai.yaml", "openai.yaml"), flat / "openai.yaml")
-            for name in ("exam_profiles.json", "evidence-schema.md", "image-composition.md", "manifest.md"):
-                shutil.copy2(source(f"references/{name}", name), flat / name)
-            for name in (
-                "compose_score_images.py", "run_assessment.py", "manifest_runtime.py", "build_workbook.py", "ocr_api.py",
-                "ocr_vision.swift", "package_skill.py", "test_pipeline.py",
-            ):
-                shutil.copy2(source(f"scripts/{name}", name), flat / name)
-            completed = subprocess.run(
-                [sys.executable, str(flat / "package_skill.py")],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            archive_path = flat / "dist" / "score-kuaishou-exams.zip"
-            self.assertTrue(archive_path.is_file())
-            with zipfile.ZipFile(archive_path) as archive:
-                names = archive.namelist()
-            self.assertTrue(names)
-            self.assertTrue(all(name.startswith("score-kuaishou-exams/") for name in names))
 
     def test_zero_student_result_is_incomplete(self):
         result = pipeline.build_scored_result(

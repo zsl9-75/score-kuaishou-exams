@@ -6,7 +6,7 @@
 
 1. 查看每张输入图片，记录绝对路径、组别、进度、考核类型、原始维度顺序、姓名、各维度百分比和源图总准确率。
 2. OCR只能辅助识别；12.5%、37.5%、62.5%、87.5%及两位小数总准确率必须回看原图。看不清、重名或跨图姓名不一致时停止，不得猜测。
-3. 把确认后的数据写入临时composition JSON，再运行：
+3. 把确认后的数据写入临时composition JSON。已知只有一种考试结构时可指定单图：
 
 ```bash
 python3 scripts/compose_score_images.py \
@@ -14,7 +14,15 @@ python3 scripts/compose_score_images.py \
   --output /absolute/delivery/合并成绩图.png
 ```
 
-4. 只使用CLI最后一行JSON中的`png`绝对路径交付，并在回复前确认文件存在。
+4. 多组或结构尚未确定时，让脚本按结构自动合图或分图：
+
+```bash
+python3 scripts/compose_score_images.py \
+  --composition-json /absolute/temp/compose.json \
+  --output-dir /absolute/delivery/优化后
+```
+
+5. 只使用CLI最后一行JSON中的`pngs[].path`绝对路径交付，并在回复前确认所有文件存在。单图模式同时保留`png`字段。
 
 ## Composition JSON
 
@@ -63,6 +71,17 @@ python3 scripts/compose_score_images.py \
 - `overall`保留源图汇总值。源图没有汇总值时可写`null`，输出为灰底`／`。
 - `category_order`和`group_order`可选；未指定时考核类型默认按文生、图生、其他来源排列，组别按输入首次出现顺序排列。
 
+## 考试结构签名与自动分图
+
+`layout: auto`不根据“28组”或“29–31组”选择固定模板。脚本先对每个组生成结构签名，再按签名分桶：
+
+- 签名包含最终渲染的考核类型及顺序、每类考核的原生维度及顺序、汇总列名，以及实际生效的补充指标来源、目标和输出列。
+- 签名不包含组名、进度、学员姓名、成绩值、图片文件名或标题。因此不同进度但考试结构完全一致的组仍可合并。
+- 单组是同一算法的最小情形；两个及以上同签名组进入同一张图，不同签名组在`--output-dir`模式下自动生成不同PNG。
+- `--output`只接受单一结构；检测到多个签名时返回`status=stopped`并提示改用`--output-dir`。
+- `stack_by_assessment`是显式单结构模式。若输入包含不同签名则停止，不自动分图。
+- 结构分组不会将数据错误变成缺失格。同一组内身份集合不一致、重名、成绩缺失或冲突仍立即停止。
+
 ## 动态维度与缺失格
 
 - 脚本按考核类型合并同类source，再以考核类型顺序求全局维度并集。
@@ -74,7 +93,8 @@ python3 scripts/compose_score_images.py \
 
 ## 自动排版与追加指标
 
-- `layout: auto`和`stack_by_assessment`均使用单一表头，按考核类型分区，并在每个类型下连续排列姓名；不按同学把文生/图生配成相邻双行。
+- 每张图使用单一表头，排序恒为“考核类型 → 组别 → 学员”；不按同学把文生/图生配成相邻双行。
+- 每组以第一个最终渲染的考核类型作为学员顺序基准；后续考核严格按姓名重排，不依赖各源图的原始行序。
 - 各考核类型在同一组必须有完全相同的姓名集合。缺人、多人或重名时停止。
 - 用户明确要求把补充指标追加到主表时，使用`append_metrics`。追加列位于源图总准确率之后，来源考核默认不再单独渲染：
 
@@ -92,11 +112,14 @@ python3 scripts/compose_score_images.py \
 ```
 
 - 追加指标严格按`组别 + 姓名`匹配；来源与目标姓名集合不一致、目标值缺失或输出列重名时停止。
+- 追加列位于汇总列之后；只有`target_label`对应考核区显示数值，其他渲染考核区统一显示灰底`／`。
 - 只有用户同时还需要来源考核独立分区时，才设置`keep_source: true`。
 
 ## 输出验收
 
 - 色阶固定为：90–100% `#6AB37B`、80–89% `#A7D08D`、70–79% `#FEE07B`、60–69% `#F5A05C`、低于60% `#F35161`。
 - 表头为浅蓝色；组别、进度和考核类型按连续行合并；长表头自动换行；全图只保留一个图例。
+- 组别或考核区切换时使用加粗分隔线；分隔线不穿过跨边界继续合并的组别、进度或考核单元格。
 - 输出必须能由Pillow重新打开，`row_count`与composition JSON中的有效人员行一致，`missing_cells`与预期斜杠格数量一致。
+- `--output-dir`会先完成全部身份和结构校验，再把所有PNG绘制到临时目录，全部成功后才替换正式文件。返回的`pngs`中每项包含`path`、`groups`、`structure_signature`、`row_count`、`missing_cells`及画布尺寸。
 - CLI返回`status=stopped`时不得交付PNG，必须把`reason`和`next_action`原样告诉用户。

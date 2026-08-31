@@ -10,13 +10,7 @@
 请使用 $skill-installer 从 https://github.com/zsl9-75/score-kuaishou-exams 安装仓库根目录的 Skill：path 使用 .，安装名使用 score-kuaishou-exams。
 ```
 
-标准安装应保留 `scripts/`、`references/` 和 `agents/`。若目标平台仍会自动平铺，当前脚本也能从Skill根目录寻找同名配置和OCR资源；如需手动重建标准ZIP，运行根目录或 `scripts/` 下的 `package_skill.py`。
-
-```bash
-python3 scripts/package_skill.py
-```
-
-生成的 ZIP 会保留顶层 `score-kuaishou-exams/` 目录和所有子目录。Excel与PNG依赖可用下列方式安装：
+标准安装应保留 `scripts/`、`references/` 和 `agents/`。若目标平台仍会自动平铺，当前脚本也能从Skill根目录寻找同名配置和OCR资源。Excel与PNG依赖可用下列方式安装：
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -31,6 +25,8 @@ python3 -m pip install -r requirements.txt
 ```
 
 同一次考核继续运行时要复用原来的 Manifest 和 `task_id`；换一次考核就使用新的 `task_id`。Skill 会把首次学到的最小页签和范围只固化在本次考核中，后续同学复用，不会跨考核套用旧范围。
+
+检查点还会绑定组别、考试配置、场次、标准答案和作业来源的身份指纹。如果误把29组的 `task_id` 用给30组，或把结业文生的 `task_id` 用给补考文生，程序会明确停止并要求创建新 `task_id`。文档 revision、学员增删、输出目录和并发数变化不会误触发该保护。
 
 ## 为什么不会再因中间格式错误直接停止
 

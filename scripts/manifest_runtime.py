@@ -27,6 +27,7 @@ INCOMPLETE_DOCUMENT_STATUSES = {"pending", "failed", "deferred_layout", "pending
 WORKFLOW_VERSION = 2
 WORKFLOW_COMMANDS = ("capabilities", "workflow", "specs", "plan", "ingest", "ingest-batch", "fail", "status")
 INTERNAL_ERROR_LIMIT = 3
+MANIFEST_IDENTITY_VERSION = 1
 RUNTIME_DIR = Path(__file__).resolve().parent
 if (RUNTIME_DIR.parent / "references" / "exam_profiles.json").is_file():
     PROFILE_CONFIG_PATH = RUNTIME_DIR.parent / "references" / "exam_profiles.json"
@@ -37,6 +38,10 @@ else:
 
 
 class ManifestError(RuntimeError):
+    pass
+
+
+class ManifestIdentityMismatch(ManifestError):
     pass
 
 
@@ -255,6 +260,94 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _source_identity(manifest: dict[str, Any], raw: Any, *, role: str) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {"kind": "missing", "source_id": ""}
+    document = raw.get("document") if isinstance(raw.get("document"), dict) else {}
+    url = str(raw.get("url") or document.get("url") or "").strip()
+    document_id = str(raw.get("id") or document.get("id") or (document_id_from_url(url) if url else "")).strip()
+    if document_id or url:
+        return {"kind": "docs", "source_id": document_id or stable_hash(url)[:16]}
+    for key in ("images", "path", "evidence"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            resolved = resolve_path(Path(manifest["_base"]), value)
+            return {"kind": key, "source_id": str(resolved or value)}
+    return {"kind": role, "source_id": ""}
+
+
+def manifest_identity_payload(manifest: dict[str, Any]) -> dict[str, Any]:
+    homework = manifest.get("homework") if isinstance(manifest.get("homework"), dict) else {}
+    if isinstance(homework.get("index"), dict):
+        homework_source = _source_identity(manifest, homework["index"], role="homework_index")
+    elif "documents" in homework:
+        # The explicit student list may legitimately add or remove people while the
+        # same assessment resumes, so bind the source mode rather than roster contents.
+        homework_source = {"kind": "explicit_documents", "source_id": ""}
+    else:
+        homework_source = _source_identity(manifest, homework, role="homework")
+    return {
+        "identity_version": MANIFEST_IDENTITY_VERSION,
+        "group": str(manifest.get("group") or "").strip(),
+        "exam_profile": str(manifest.get("exam_profile") or "").strip(),
+        "progress": str(manifest.get("progress") or "").strip(),
+        "standard_source": _source_identity(manifest, manifest.get("standard"), role="standard"),
+        "homework_source": homework_source,
+    }
+
+
+def manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    payload = manifest_identity_payload(manifest)
+    return {**payload, "fingerprint": stable_hash(payload)}
+
+
+def _identity_differences(recorded: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    labels = {
+        "group": "组别",
+        "exam_profile": "考试配置",
+        "progress": "考试场次/进度",
+        "standard_source": "标准答案来源",
+        "homework_source": "作业来源",
+    }
+    differences: list[str] = []
+    for key, label in labels.items():
+        if recorded.get(key) != current.get(key):
+            old = json.dumps(recorded.get(key), ensure_ascii=False, sort_keys=True)
+            new = json.dumps(current.get(key), ensure_ascii=False, sort_keys=True)
+            differences.append(f"{label}原为{old}，现为{new}")
+    return differences
+
+
+def bind_manifest_identity(manifest: dict[str, Any], state: dict[str, Any]) -> None:
+    current = manifest_identity(manifest)
+    recorded = state.get("manifest_identity")
+    if not isinstance(recorded, dict) or not recorded.get("fingerprint"):
+        # Backward-compatible migration for checkpoints created before identity
+        # binding existed. Existing document identities still provide one safety check.
+        expected_standard = current["standard_source"].get("source_id", "")
+        stored_standard_ids = {
+            str(item.get("document_id") or "")
+            for item in state.get("documents", {}).values()
+            if isinstance(item, dict) and item.get("role") == "standard" and item.get("document_id")
+        }
+        if stored_standard_ids and expected_standard not in stored_standard_ids:
+            raise ManifestIdentityMismatch(
+                f"task_id={manifest['task_id']} 的旧检查点属于另一份标准答案"
+                f"（旧={sorted(stored_standard_ids)}，当前={expected_standard!r}）。"
+                "为防止串组或串考试，请为当前组别/考试创建新的 task_id；--refresh 不会覆盖此保护。"
+            )
+        state["manifest_identity"] = current
+        return
+    if recorded.get("fingerprint") == current["fingerprint"]:
+        return
+    differences = _identity_differences(recorded, current)
+    detail = "；".join(differences) or "Manifest核心身份指纹已变化"
+    raise ManifestIdentityMismatch(
+        f"task_id={manifest['task_id']} 已绑定到另一次考试：{detail}。"
+        "为防止串组或串考试，请为新组别/新考试创建新的 task_id；--refresh 只刷新同一任务，不会覆盖此保护。"
+    )
+
+
 def cache_root(manifest: dict[str, Any]) -> Path:
     base = Path(manifest["_base"])
     configured = manifest.get("cache", {}).get("dir", ".score-cache") if isinstance(manifest.get("cache"), dict) else ".score-cache"
@@ -343,7 +436,7 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
         if legacy.exists() and legacy != path:
             path = legacy
     if not path.exists():
-        return {
+        state = {
             "schema_version": 2,
             "task_id": manifest["task_id"],
             "documents": {},
@@ -369,12 +462,15 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
             },
             "index_issues": [],
         }
+        bind_manifest_identity(manifest, state)
+        return state
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ManifestError(f"任务状态损坏：{path}：{exc}") from exc
     if str(state.get("task_id") or "") != str(manifest["task_id"]):
         raise ManifestError(f"任务状态 task_id 不匹配：{path}")
+    bind_manifest_identity(manifest, state)
     state.setdefault("documents", {})
     state.setdefault("resolved_students", [])
     state.setdefault("layouts", {})
@@ -401,6 +497,7 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_state(manifest: dict[str, Any], state: dict[str, Any]) -> None:
+    bind_manifest_identity(manifest, state)
     atomic_write_json(state_path(manifest), state)
 
 
@@ -761,8 +858,30 @@ def load_evidence_payload(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ManifestError(f"证据必须是 schema_version=1 的JSON对象：{path}")
+    payload = normalize_evidence_rows(payload, path)
     validate_evidence_payload(payload, path)
     return payload
+
+
+def normalize_evidence_rows(payload: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    """Return a shallow evidence clone with trailing omitted cells padded as null."""
+    label = f"：{path}" if path else ""
+    headers = payload.get("headers")
+    rows = payload.get("rows")
+    if not isinstance(headers, list) or not headers:
+        raise ManifestError(f"证据 headers 必须是非空数组{label}")
+    if not isinstance(rows, list):
+        raise ManifestError(f"证据 rows 必须是数组{label}")
+    normalized_rows: list[list[Any]] = []
+    for row_number, row in enumerate(rows, start=2):
+        if not isinstance(row, list):
+            raise ManifestError(f"证据第{row_number}行必须是数组{label}")
+        if len(row) > len(headers):
+            raise ManifestError(f"证据第{row_number}行列数超过表头{label}")
+        normalized_rows.append(list(row) + [None] * (len(headers) - len(row)))
+    normalized = dict(payload)
+    normalized["rows"] = normalized_rows
+    return normalized
 
 
 def validate_evidence_payload(payload: dict[str, Any], path: Path | None = None) -> None:
@@ -791,6 +910,8 @@ def validate_evidence_payload(payload: dict[str, Any], path: Path | None = None)
             raise ManifestError(f"证据第{row_number}行必须是数组{label}")
         if len(row) > len(headers):
             raise ManifestError(f"证据第{row_number}行列数超过表头{label}")
+        if len(row) < len(headers):
+            raise ManifestError(f"证据第{row_number}行列数少于表头，缺失的行末空单元格必须补为 null{label}")
 
 
 def evidence_metadata(payload: dict[str, Any]) -> dict[str, str]:
@@ -1849,6 +1970,7 @@ def main() -> int:
         return cli()
     except Exception as exc:
         recoverable = isinstance(exc, ManifestCliError)
+        identity_mismatch = isinstance(exc, ManifestIdentityMismatch)
         invalid_command = exc.invalid_command if isinstance(exc, ManifestCliError) else ""
         suggestion = ""
         if invalid_command:
@@ -1857,7 +1979,7 @@ def main() -> int:
         print(f"错误：{exc}", file=sys.stderr)
         print(json.dumps({
             "status": "stopped",
-            "error_code": "cli_contract_error" if recoverable else "manifest_error",
+            "error_code": "cli_contract_error" if recoverable else ("manifest_identity_mismatch" if identity_mismatch else "manifest_error"),
             "recoverable": recoverable,
             "valid_commands": list(WORKFLOW_COMMANDS) if recoverable else [],
             "suggested_command": suggestion,
@@ -1865,7 +1987,11 @@ def main() -> int:
             "stopped_items": [{
                 "stage": "manifest",
                 "reason": str(exc),
-                "next_action": "执行 capabilities --json 并使用workflow统一入口自动重试" if recoverable else "修复Manifest、证据、权限或读取状态后，复用同一 task_id 继续执行",
+                "next_action": (
+                    "执行 capabilities --json 并使用workflow统一入口自动重试"
+                    if recoverable
+                    else ("为当前组别/考试创建新的 task_id；原 task_id 只用于原考试续跑" if identity_mismatch else "修复Manifest、证据、权限或读取状态后，复用同一 task_id 继续执行")
+                ),
             }],
         }, ensure_ascii=False), file=sys.stderr)
         return 2

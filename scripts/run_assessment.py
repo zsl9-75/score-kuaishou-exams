@@ -29,6 +29,7 @@ from manifest_runtime import (
     ingest_evidence,
     load_manifest,
     load_state,
+    normalize_evidence_rows,
     plan_reads,
     resolve_path,
     scoring_documents,
@@ -289,16 +290,13 @@ def flatten_documents(payload: Any, source_path: Path) -> list[dict[str, Any]]:
             raise AssessmentError(f"证据缺少 headers：{source_path} 第 {index} 项")
         if not isinstance(rows, list):
             raise AssessmentError(f"证据缺少 rows：{source_path} 第 {index} 项")
-        normalized_rows: list[list[Any]] = []
-        for row_number, row in enumerate(rows, start=2):
-            if not isinstance(row, list):
-                raise AssessmentError(f"证据第 {row_number} 行必须是数组：{source_path}")
-            if len(row) > len(headers):
-                raise AssessmentError(f"证据第 {row_number} 行列数超过表头：{source_path}")
-            normalized_rows.append(row + [None] * (len(headers) - len(row)))
         clone = dict(doc)
         clone["headers"] = headers
-        clone["rows"] = normalized_rows
+        clone["rows"] = rows
+        try:
+            clone = normalize_evidence_rows(clone, source_path)
+        except ManifestError as exc:
+            raise AssessmentError(str(exc)) from exc
         confidence, confidence_issues = normalize_image_confidence(clone)
         if clone.get("source") == "image_ocr":
             clone["confidence"] = confidence

@@ -93,6 +93,20 @@ Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sh
 
 `homework.layout_reuse.enabled=true` 时，不要在 `document_defaults.range` 中固定跨考核范围。`discovery_range` 只是首份作业的发现上界；首份证据必须记录实际最小范围。该范围仅保存在当前 `task_id` 的 `.score-cache/runs/`状态中，同一考核后续学员复用；新考核使用新 `task_id` 会重新学习。
 
+## task_id 身份绑定
+
+一个 `task_id` 只代表一个组别的一次具体考试。首次写入检查点时，运行时会保存 `manifest_identity`，其指纹只包含：
+
+- `group`：当前组别，例如 `29组`；
+- `exam_profile`：结业文生、结业图生、补考文生等考试配置；
+- `progress`：第一次、第二次或其他用于区分场次的进度名称；
+- 标准答案的文档 ID，或截图/本地证据来源；
+- 作业索引文档 ID 或作业来源模式。
+
+下列字段不进入身份指纹，因为它们可以在同一考试续跑时合法变化：文档 `revision`、学员增删、输出目录、并发数和重试参数。
+
+如果同一 `task_id` 的组别、考试配置、场次、标准答案或作业来源发生变化，CLI返回 `error_code=manifest_identity_mismatch` 并停止；为新组别/新考试创建新 `task_id`。`--refresh` 只能刷新同一任务的权限、revision和证据，不会清除身份绑定。旧版检查点首次读取时自动迁移；如果已记录的标准答案文档与当前 Manifest 不同，迁移也会停止。
+
 ## 统一workflow接口
 
 Agent默认只调用 `capabilities --json` 和 `workflow`。`specs`、`plan`、`ingest`、`ingest-batch`、`fail`与`status`保留为兼容/调试接口，禁止Agent在任务中猜测新的底层命令。
@@ -196,7 +210,7 @@ python3 scripts/manifest_runtime.py ingest-batch \
 - `output.xlsx` 是 `auto|on|off`，默认 `off`。
 - `output.dir` 必须是绝对交付目录；推荐每次显式传绝对 `--output`，避免返回Skill目录或临时目录。
 - 每次运行在 `output.dir` 下生成独立的 `组别_进度__run_id/` 原子发布目录；正式JSON中的绝对路径是本次唯一交付依据。
-- `cache.dir` 默认 `.score-cache`，必须留在本地运行目录，不进入交付 ZIP。
+- `cache.dir` 默认 `.score-cache`，必须留在本地运行目录，不对用户交付，也不提交到 Skill 仓库。
 - `runtime.ocr_workers` 是API OCR并发数，默认4，只允许1–8；`runtime.ocr_confidence_threshold` 默认0.75。
 - `runtime.ocr_engine` 是 `auto|vision|api`；`auto` 在macOS使用Vision，其他系统使用API。
 - 截图标准答案与作业都必须逐题提供有效OCR置信度；任何待复核项都会停止正式PNG/Excel并写入 `stopped_items`。
