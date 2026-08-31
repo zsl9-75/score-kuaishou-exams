@@ -65,6 +65,30 @@ Manifest 内的证据、别名和缓存相对路径都相对于 Manifest 所在�
 }
 ```
 
+同一张标准表含两套同名 `ID` 列、同一学员的两个维度又分别位于两份文档时，使用显式维度契约：
+
+```json
+{
+  "exam_profile": "online-aesthetics-dual",
+  "standard": {
+    "url": "https://docs.corp.kuaishou.com/standard",
+    "dimension_bindings": {
+      "画面美学": {"id_index": 0, "value_index": 1},
+      "动态美学": {"id_index": 2, "value_index": 3}
+    }
+  },
+  "homework": {
+    "documents": [
+      {"student": "张三", "url": "https://docs.corp.kuaishou.com/zhang-image", "dimension": "画面美学"},
+      {"student": "张三", "url": "https://docs.corp.kuaishou.com/zhang-dynamic", "dimension": "动态美学"}
+    ],
+    "layout_reuse": {"enabled": true, "discovery_range": "A1:AB200"}
+  }
+}
+```
+
+`dimension` 是单维简写，也可写为 `dimensions` 数组。`workflow` 返回的读取项会原样携带 `dimensions` 或 `dimension_bindings`；Docs 原始读取生成证据时必须原样写回这些字段。列下标从0开始，标准答案绑定必须覆盖考试配置的全部维度，且任何列不能被两个绑定复用。
+
 截图考试使用 `screenshot-*` 配置时，Manifest 不执行Docs发现读取，直接读取图片：
 
 ```json
@@ -92,7 +116,7 @@ Manifest 内的证据、别名和缓存相对路径都相对于 Manifest 所在�
 
 Agent 读取 Docs 后，可在对应文档对象中临时填写 `revision`、`sheet`、`range` 或在 `plan --revisions` 快照中提供。`evidence` 只用于已有本地证据 JSON 的预读/测试流程。
 
-`homework.layout_reuse.enabled=true` 时，不要在 `document_defaults.range` 中固定跨考核范围。`discovery_range` 只是首份作业的发现上界；首份证据必须记录实际最小范围。该范围仅保存在当前 `task_id` 的 `.score-cache/runs/`状态中，同一考核后续学员复用；新考核使用新 `task_id` 会重新学习。
+`homework.layout_reuse.enabled=true` 时，不要在 `document_defaults.range` 中固定跨考核范围。`discovery_range` 只是首份作业的发现上界；首份证据必须记录实际最小范围。该范围按 `task_id + dimensions` 分开保存：画面美学模板不能用于动态美学，同一维度的后续学员才可复用；新考核使用新 `task_id` 会重新学习。
 
 ## task_id 身份绑定
 
@@ -120,7 +144,7 @@ python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json
 `workflow` 每次返回 `workflow_status`、`operation_id`、`action`、`recoverable`、`blocked_items` 和 `user_actions`：
 
 - `preflight_docs` 仍可批量检查全部待读文档，因为它只返回权限、revision和范围等紧凑元数据。
-- `read_docs` 按 `runtime.checkpoint_batch_size` 切成耐中断小批次；默认每批3份，布局探测或布局回退固定为1份。
+- `read_docs` 按 `runtime.checkpoint_batch_size` 切成耐中断小批次；默认每批3份，布局探测或布局回退固定为1份。分维度文档各自学习布局，不共用探测结果。
 - 当前小批次每份证据落盘后立即提交。允许只提交批次中已经完成的部分，未回传项会保留并出现在下一次 `read_docs`，不会被判定为失败。
 - `action.effective_concurrency` 只控制当前小批次并发，不能超过批次数或 `runtime.max_concurrency`。
 

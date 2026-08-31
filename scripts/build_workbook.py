@@ -195,7 +195,7 @@ def build_anomalies(ws, data: dict[str, Any]) -> None:
 
 
 def build_evidence(ws, data: dict[str, Any]) -> None:
-    append_safe(ws, ["来源", "本地证据路径", "文档链接", "文档ID", "Revision", "工作表/图片", "范围", "读取时间", "内容SHA-256"])
+    append_safe(ws, ["来源", "本地证据路径", "文档链接", "文档ID", "Revision", "工作表/图片", "范围", "维度", "维度列绑定", "读取时间", "内容SHA-256"])
     for item in data.get("evidence", []):
         append_safe(
             ws,
@@ -207,11 +207,13 @@ def build_evidence(ws, data: dict[str, Any]) -> None:
                 item.get("revision", ""),
                 item.get("sheet", ""),
                 item.get("range", ""),
+                "、".join(item.get("dimensions") or []),
+                json.dumps(item.get("dimension_bindings") or {}, ensure_ascii=False, separators=(",", ":")),
                 item.get("read_at", ""),
                 item.get("content_sha256", ""),
             ]
         )
-    style_sheet(ws, [14, 46, 52, 20, 18, 22, 14, 24, 48])
+    style_sheet(ws, [14, 46, 52, 20, 18, 22, 14, 20, 46, 24, 48])
     for row in range(2, ws.max_row + 1):
         ws.row_dimensions[row].height = 42
 

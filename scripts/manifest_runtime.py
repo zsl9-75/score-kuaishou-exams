@@ -198,6 +198,62 @@ def classify_error_kind(error: str, explicit: str | None = None) -> str:
     return "other"
 
 
+def normalize_dimensions(value: Any, *, label: str) -> list[str]:
+    if value is None or value == "":
+        return []
+    raw = value if isinstance(value, list) else [value]
+    if not raw or any(not isinstance(item, str) or not item.strip() for item in raw):
+        raise ManifestError(f"{label} dimensions 必须是非空维度名称数组")
+    dimensions = [item.strip() for item in raw]
+    if len(dimensions) != len(set(dimensions)):
+        raise ManifestError(f"{label} dimensions 不能重复")
+    return dimensions
+
+
+def normalize_dimension_bindings(value: Any, *, label: str) -> dict[str, dict[str, int]]:
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise ManifestError(f"{label} dimension_bindings 必须是非空对象")
+    normalized: dict[str, dict[str, int]] = {}
+    used_columns: dict[int, str] = {}
+    for raw_dimension, raw_binding in value.items():
+        dimension = str(raw_dimension or "").strip()
+        if not dimension or not isinstance(raw_binding, dict):
+            raise ManifestError(f"{label} dimension_bindings 的维度名和绑定必须有效")
+        binding: dict[str, int] = {}
+        for key in ("id_index", "value_index"):
+            raw_index = raw_binding.get(key)
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
+                raise ManifestError(f"{label} {dimension}.{key} 必须是从0开始的非负整数")
+            binding[key] = raw_index
+        if binding["id_index"] == binding["value_index"]:
+            raise ManifestError(f"{label} {dimension} 的ID列和答案列不能相同")
+        for key, index in binding.items():
+            owner = f"{dimension}.{key}"
+            if index in used_columns and used_columns[index] != owner:
+                raise ManifestError(f"{label} 第{index}列被多个维度绑定：{used_columns[index]}、{owner}")
+            used_columns[index] = owner
+        normalized[dimension] = binding
+    return normalized
+
+
+def validate_spec_dimensions(manifest: dict[str, Any], spec: dict[str, Any]) -> None:
+    config = load_profile_config()
+    profile = config["profiles"].get(manifest["exam_profile"])
+    if not isinstance(profile, dict):
+        raise ManifestError(f"未知考试配置：{manifest['exam_profile']}")
+    allowed = list(profile.get("dimensions") or [])
+    assigned = list(spec.get("dimensions") or [])
+    bindings = dict(spec.get("dimension_bindings") or {})
+    unknown = sorted((set(assigned) | set(bindings)) - set(allowed))
+    if unknown:
+        raise ManifestError("文档绑定了当前考试不存在的维度：" + "、".join(unknown))
+    if spec.get("role") == "standard" and bindings and set(bindings) != set(allowed):
+        missing = [dimension for dimension in allowed if dimension not in bindings]
+        raise ManifestError("标准答案 dimension_bindings 必须覆盖考试全部维度，缺少：" + "、".join(missing))
+
+
 def normalize_document_spec(raw: dict[str, Any], *, role: str, student: str = "", defaults: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ManifestError(f"{role} 文档配置必须是对象")
@@ -207,7 +263,22 @@ def normalize_document_spec(raw: dict[str, Any], *, role: str, student: str = ""
     document_id = str(merged.get("id") or document.get("id") or (document_id_from_url(url) if url else ""))
     if not url and not document_id:
         raise ManifestError(f"{role} 文档必须提供 url 或 id")
-    item_seed = {"role": role, "student": student, "id": document_id, "url": url}
+    raw_dimensions = merged.get("dimensions")
+    if raw_dimensions is None and merged.get("dimension") is not None and merged.get("dimension") != "":
+        raw_dimensions = merged.get("dimension")
+    dimensions = normalize_dimensions(raw_dimensions, label=f"{role} 文档")
+    dimension_bindings = normalize_dimension_bindings(
+        merged.get("dimension_bindings"),
+        label=f"{role} 文档",
+    )
+    item_seed = {
+        "role": role,
+        "student": student,
+        "id": document_id,
+        "url": url,
+        "dimensions": dimensions,
+        "dimension_bindings": dimension_bindings,
+    }
     return {
         "item_id": str(merged.get("item_id") or stable_hash(item_seed)[:20]),
         "role": role,
@@ -218,6 +289,8 @@ def normalize_document_spec(raw: dict[str, Any], *, role: str, student: str = ""
         "sheet": str(merged.get("sheet") or ""),
         "range": str(merged.get("range") or ""),
         "evidence": str(merged.get("evidence") or ""),
+        "dimensions": dimensions,
+        "dimension_bindings": dimension_bindings,
     }
 
 
@@ -529,7 +602,11 @@ def save_state(manifest: dict[str, Any], state: dict[str, Any]) -> None:
 def evidence_cache_key(spec: dict[str, Any]) -> str | None:
     if not spec.get("revision"):
         return None
-    return stable_hash({key: spec.get(key, "") for key in ("role", "student", "document_id", "revision", "sheet", "range")})
+    return stable_hash({
+        **{key: spec.get(key, "") for key in ("role", "student", "document_id", "revision", "sheet", "range")},
+        "dimensions": list(spec.get("dimensions") or []),
+        "dimension_bindings": dict(spec.get("dimension_bindings") or {}),
+    })
 
 
 def evidence_cache_path(manifest: dict[str, Any], spec: dict[str, Any]) -> Path | None:
@@ -538,7 +615,7 @@ def evidence_cache_path(manifest: dict[str, Any], spec: dict[str, Any]) -> Path 
 
 
 def legacy_evidence_cache_path(manifest: dict[str, Any], spec: dict[str, Any]) -> Path | None:
-    if not spec.get("revision"):
+    if not spec.get("revision") or spec.get("dimensions") or spec.get("dimension_bindings"):
         return None
     key = stable_hash({key: spec.get(key, "") for key in ("document_id", "revision", "sheet", "range")})
     return cache_root(manifest) / "evidence" / f"{key}.json"
@@ -556,7 +633,9 @@ def document_specs(manifest: dict[str, Any], state: dict[str, Any], *, stage: st
         return clone
 
     if stage in {"initial", "all"}:
-        specs.append(reuse_state(normalize_document_spec(manifest["standard"], role="standard")))
+        standard_spec = normalize_document_spec(manifest["standard"], role="standard")
+        validate_spec_dimensions(manifest, standard_spec)
+        specs.append(reuse_state(standard_spec))
         homework = manifest["homework"]
         if isinstance(homework, dict) and homework.get("index"):
             specs.append(reuse_state(normalize_document_spec(homework["index"], role="homework_index")))
@@ -571,7 +650,9 @@ def document_specs(manifest: dict[str, Any], state: dict[str, Any], *, stage: st
             student = str(item.get("student") or item.get("name") or "").strip()
             if not student:
                 raise ManifestError("学员作业配置缺少 student")
-            specs.append(reuse_state(normalize_document_spec(item, role="homework", student=student, defaults=defaults)))
+            homework_spec = normalize_document_spec(item, role="homework", student=student, defaults=defaults)
+            validate_spec_dimensions(manifest, homework_spec)
+            specs.append(reuse_state(homework_spec))
     return specs
 
 
@@ -585,6 +666,22 @@ def homework_layout_config(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def homework_layout_scope(spec: dict[str, Any]) -> str:
+    dimensions = list(spec.get("dimensions") or [])
+    return "dimensions:" + "|".join(dimensions) if dimensions else "dimensions:__all__"
+
+
+def learned_homework_layout(state: dict[str, Any], scope: str) -> dict[str, Any] | None:
+    layouts = state.get("layouts", {})
+    scoped = layouts.get("homework_by_dimension")
+    if isinstance(scoped, dict) and isinstance(scoped.get(scope), dict):
+        return scoped[scope]
+    legacy = layouts.get("homework")
+    if scope == "dimensions:__all__" and isinstance(legacy, dict) and "sheet" in legacy:
+        return legacy
+    return None
+
+
 def prepare_homework_layout_specs(
     manifest: dict[str, Any],
     state: dict[str, Any],
@@ -593,14 +690,16 @@ def prepare_homework_layout_specs(
     config = homework_layout_config(manifest)
     if not config["enabled"]:
         return specs
-    learned = state.get("layouts", {}).get("homework")
     prepared: list[dict[str, Any]] = []
-    unresolved: list[dict[str, Any]] = []
+    unresolved_by_scope: dict[str, list[dict[str, Any]]] = {}
     for original in specs:
         spec = dict(original)
         if spec.get("role") != "homework":
             prepared.append(spec)
             continue
+        scope = homework_layout_scope(spec)
+        spec["layout_scope"] = scope
+        learned = learned_homework_layout(state, scope)
         if spec.get("workflow_preflight_pending"):
             prepared.append(spec)
             continue
@@ -626,26 +725,29 @@ def prepare_homework_layout_specs(
             prepared.append(spec)
             continue
         if config["force_probe"]:
-            unresolved.append(spec)
+            unresolved_by_scope.setdefault(scope, []).append(spec)
             continue
         if spec.get("sheet") and spec.get("range"):
             spec.setdefault("read_mode", "fixed")
             prepared.append(spec)
             continue
-        unresolved.append(spec)
+        unresolved_by_scope.setdefault(scope, []).append(spec)
 
-    if not unresolved:
+    if not unresolved_by_scope:
         return prepared
-    probe_item_id = str(state.get("scheduler", {}).get("layout_probe_item_id") or "")
-    if not any(item["item_id"] == probe_item_id for item in unresolved):
-        probe_item_id = unresolved[0]["item_id"]
-        state.setdefault("scheduler", {})["layout_probe_item_id"] = probe_item_id
-    for spec in unresolved:
-        if spec["item_id"] == probe_item_id:
-            spec.update({"range": "", "read_mode": "discovery_probe", "discovery_range": config["discovery_range"]})
-        else:
-            spec.update({"read_mode": "deferred_layout", "deferred_layout": True})
-        prepared.append(spec)
+    scheduler = state.setdefault("scheduler", {})
+    probe_ids = scheduler.setdefault("layout_probe_item_ids", {})
+    for scope, unresolved in unresolved_by_scope.items():
+        probe_item_id = str(probe_ids.get(scope) or "")
+        if not any(item["item_id"] == probe_item_id for item in unresolved):
+            probe_item_id = unresolved[0]["item_id"]
+            probe_ids[scope] = probe_item_id
+        for spec in unresolved:
+            if spec["item_id"] == probe_item_id:
+                spec.update({"range": "", "read_mode": "discovery_probe", "discovery_range": config["discovery_range"]})
+            else:
+                spec.update({"read_mode": "deferred_layout", "deferred_layout": True})
+            prepared.append(spec)
     return prepared
 
 
@@ -657,7 +759,7 @@ def resolve_unique_header(headers: list[Any], candidates: list[str], label: str)
     return matches[0]
 
 
-def inspect_homework_layout(manifest: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+def inspect_homework_layout(manifest: dict[str, Any], payload: dict[str, Any], dimensions: list[str] | None = None) -> dict[str, Any]:
     config = load_profile_config()
     profile = config["profiles"].get(manifest["exam_profile"])
     if not isinstance(profile, dict):
@@ -667,8 +769,9 @@ def inspect_homework_layout(manifest: dict[str, Any], payload: dict[str, Any]) -
     if not isinstance(headers, list) or not isinstance(rows, list):
         raise LayoutMismatch("快速范围证据缺少 headers 或 rows 数组")
     id_header = resolve_unique_header(headers, list(config.get("id_headers") or []), "ID")
+    expected_dimensions = list(dimensions or profile.get("dimensions", []))
     dimension_headers: dict[str, str] = {}
-    for dimension in profile.get("dimensions", []):
+    for dimension in expected_dimensions:
         aliases = list(config.get("header_aliases", {}).get(dimension) or [dimension])
         dimension_headers[dimension] = resolve_unique_header(headers, aliases, dimension)
     id_index = next(index for index, value in enumerate(headers) if normalize_header(value) == id_header)
@@ -691,8 +794,13 @@ def inspect_homework_layout(manifest: dict[str, Any], payload: dict[str, Any]) -
     }
 
 
-def validate_learned_layout(manifest: dict[str, Any], payload: dict[str, Any], learned: dict[str, Any]) -> None:
-    observed = inspect_homework_layout(manifest, payload)
+def validate_learned_layout(
+    manifest: dict[str, Any],
+    payload: dict[str, Any],
+    learned: dict[str, Any],
+    dimensions: list[str] | None = None,
+) -> None:
+    observed = inspect_homework_layout(manifest, payload, dimensions)
     if observed["id_count"] != int(learned.get("id_count", 0)):
         raise LayoutMismatch(f"快速范围有效ID数={observed['id_count']}，首份模板={learned.get('id_count')}")
 
@@ -755,7 +863,8 @@ def find_cached_evidence(manifest: dict[str, Any], spec: dict[str, Any], state: 
             return candidate
     entry = state.get("documents", {}).get(spec["item_id"], {})
     cached = Path(entry.get("cache_path", "")) if entry.get("cache_path") else None
-    if cached and cached.exists() and all(str(entry.get(key, "")) == str(spec.get(key, "")) for key in ("role", "student", "document_id", "revision", "sheet", "range")):
+    cache_identity_keys = ("role", "student", "document_id", "revision", "sheet", "range", "dimensions", "dimension_bindings")
+    if cached and cached.exists() and all(entry.get(key, "") == spec.get(key, "") for key in cache_identity_keys):
         try:
             validate_evidence_metadata(spec, load_evidence_payload(cached))
         except (OSError, json.JSONDecodeError, ManifestError):
@@ -780,7 +889,10 @@ def _plan_reads_unlocked(manifest: dict[str, Any], specs: list[dict[str, Any]], 
     retry: list[dict[str, Any]] = []
     for spec in specs:
         entry = state["documents"].setdefault(spec["item_id"], {})
-        entry.update({key: spec.get(key, "") for key in ("role", "student", "url", "document_id", "revision", "sheet", "range", "read_mode")})
+        entry.update({key: spec.get(key, "") for key in (
+            "role", "student", "url", "document_id", "revision", "sheet", "range", "read_mode",
+            "dimensions", "dimension_bindings", "layout_scope",
+        )})
         if spec.get("workflow_preflight_pending"):
             if entry.get("status") != "preflight_retry":
                 entry.update({"status": "preflight_pending", "error": entry.get("error", "")})
@@ -928,8 +1040,28 @@ def validate_evidence_payload(payload: dict[str, Any], path: Path | None = None)
     normalized_headers = [normalize_header(value) for value in headers]
     if any(not value for value in normalized_headers):
         raise ManifestError(f"证据表头不能为空{label}")
-    if len(normalized_headers) != len(set(normalized_headers)):
-        raise ManifestError(f"证据表头重复{label}")
+    dimensions = normalize_dimensions(payload.get("dimensions"), label="证据")
+    bindings = normalize_dimension_bindings(payload.get("dimension_bindings"), label="证据")
+    duplicate_indexes = {
+        index
+        for value in set(normalized_headers)
+        if normalized_headers.count(value) > 1
+        for index, header in enumerate(normalized_headers)
+        if header == value
+    }
+    if duplicate_indexes:
+        bound_id_indexes = {binding["id_index"] for binding in bindings.values()}
+        id_headers = {normalize_header(value) for value in load_profile_config().get("id_headers", [])}
+        if not bindings or duplicate_indexes != bound_id_indexes or any(
+            normalized_headers[index] not in id_headers for index in duplicate_indexes
+        ):
+            raise ManifestError(f"证据表头重复；只允许由 dimension_bindings 明确绑定的重复ID列{label}")
+    for dimension, binding in bindings.items():
+        for key, index in binding.items():
+            if index >= len(headers):
+                raise ManifestError(f"证据 {dimension}.{key}={index} 超出表头列数{label}")
+    if dimensions and bindings and set(dimensions) != set(bindings):
+        raise ManifestError(f"证据 dimensions 与 dimension_bindings 的维度集合不一致{label}")
     for row_number, row in enumerate(rows, start=2):
         if not isinstance(row, list):
             raise ManifestError(f"证据第{row_number}行必须是数组{label}")
@@ -991,6 +1123,14 @@ def validate_evidence_metadata(entry: dict[str, Any], payload: dict[str, Any]) -
                 identity_mismatches.append(f"学员计划={planned_student!r}、行内姓名={unexpected!r}")
         if not evidence_student and not row_identity_found:
             identity_mismatches.append(f"学员计划={planned_student!r}，但证据没有顶层或行内姓名")
+    planned_dimensions = list(entry.get("dimensions") or [])
+    evidence_dimensions = normalize_dimensions(payload.get("dimensions"), label="证据")
+    if planned_dimensions != evidence_dimensions:
+        identity_mismatches.append(f"维度计划={planned_dimensions!r}、证据={evidence_dimensions!r}")
+    planned_bindings = dict(entry.get("dimension_bindings") or {})
+    evidence_bindings = normalize_dimension_bindings(payload.get("dimension_bindings"), label="证据")
+    if planned_bindings != evidence_bindings:
+        identity_mismatches.append(f"维度列绑定计划={planned_bindings!r}、证据={evidence_bindings!r}")
     if identity_mismatches:
         raise ManifestError("证据metadata与读取计划不一致：" + "；".join(identity_mismatches + layout_mismatches))
     if layout_mismatches:
@@ -1112,16 +1252,20 @@ def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_p
     learned_layout: dict[str, Any] | None = None
     read_mode = str(entry.get("read_mode") or "")
     if entry.get("role") == "homework" and read_mode in {"discovery_probe", "learned_fast", "discovery_fallback"}:
+        dimensions = list(entry.get("dimensions") or []) or None
+        scope = str(entry.get("layout_scope") or homework_layout_scope(entry))
         try:
-            observed_layout = inspect_homework_layout(manifest, payload)
+            observed_layout = inspect_homework_layout(manifest, payload, dimensions)
             if read_mode == "learned_fast":
-                template = state.get("layouts", {}).get("homework")
+                template = learned_homework_layout(state, scope)
                 if not isinstance(template, dict):
-                    raise LayoutMismatch("本次考核的作业范围模板丢失")
-                validate_learned_layout(manifest, payload, template)
+                    raise LayoutMismatch(f"本次考核的作业范围模板丢失：{scope}")
+                validate_learned_layout(manifest, payload, template, dimensions)
             elif read_mode == "discovery_probe":
                 learned_layout = {
                     **observed_layout,
+                    "layout_scope": scope,
+                    "dimensions": list(entry.get("dimensions") or []),
                     "source_item_id": item_id,
                     "learned_at": utc_text(),
                     "task_id": manifest["task_id"],
@@ -1176,8 +1320,12 @@ def _ingest_evidence_unlocked(manifest: dict[str, Any], item_id: str, evidence_p
         state["resolved_students"] = resolved_students
         state["index_issues"] = index_issues
     if learned_layout is not None:
-        state.setdefault("layouts", {})["homework"] = learned_layout
-        state.setdefault("scheduler", {}).pop("layout_probe_item_id", None)
+        scope = str(learned_layout["layout_scope"])
+        layouts = state.setdefault("layouts", {})
+        layouts.setdefault("homework_by_dimension", {})[scope] = learned_layout
+        if scope == "dimensions:__all__":
+            layouts["homework"] = learned_layout
+        state.setdefault("scheduler", {}).setdefault("layout_probe_item_ids", {}).pop(scope, None)
     save_state(manifest, state)
     return {
         "item_id": item_id,
@@ -1298,22 +1446,32 @@ def scoring_documents(manifest: dict[str, Any]) -> tuple[Path | None, list[tuple
             if cached and cached.exists() and status in {"success", "cached"}:
                 homework_paths.append((str(entry.get("student") or ""), cached))
             elif status in INCOMPLETE_DOCUMENT_STATUSES:
-                failures.append({"student": entry.get("student", ""), "item_id": item_id, "error": entry.get("error") or "等待读取"})
-    homework_paths.sort(key=lambda item: item[0])
+                failures.append({
+                    "student": entry.get("student", ""),
+                    "dimensions": list(entry.get("dimensions") or []),
+                    "item_id": item_id,
+                    "error": entry.get("error") or "等待读取",
+                })
+    homework_paths.sort(key=lambda item: (item[0], str(item[1])))
     return standard_path, homework_paths, failures
 
 
 def public_workflow_spec(spec: dict[str, Any]) -> dict[str, Any]:
     return {
         key: spec.get(key, "")
-        for key in ("item_id", "role", "student", "url", "document_id", "revision", "sheet", "range", "read_mode", "discovery_range")
-        if spec.get(key) not in {None, ""}
+        for key in (
+            "item_id", "role", "student", "url", "document_id", "revision", "sheet", "range",
+            "read_mode", "discovery_range", "dimensions", "dimension_bindings", "layout_scope",
+        )
+        if spec.get(key) is not None and spec.get(key) != "" and spec.get(key) != [] and spec.get(key) != {}
     }
 
 
 def workflow_specs_hash(specs: list[dict[str, Any]]) -> str:
     return stable_hash([
-        {key: spec.get(key, "") for key in ("item_id", "role", "student", "url", "document_id")}
+        {key: spec.get(key, "") for key in (
+            "item_id", "role", "student", "url", "document_id", "dimensions", "dimension_bindings",
+        )}
         for spec in specs
     ])
 
@@ -1633,7 +1791,9 @@ def apply_preflight_operation(manifest: dict[str, Any], response_path: Path) -> 
                 stage_state[item_id] = {"status": "pending"}
                 continue
             entry = state["documents"].setdefault(item_id, {})
-            entry.update({key: spec.get(key, "") for key in ("role", "student", "url", "document_id")})
+            entry.update({key: spec.get(key, "") for key in (
+                "role", "student", "url", "document_id", "dimensions", "dimension_bindings",
+            )})
             entry.update({key: update.get(key, "") for key in ("revision", "sheet", "range")})
             if update.get("error") or update.get("error_kind"):
                 error = str(update.get("error") or "预检失败")

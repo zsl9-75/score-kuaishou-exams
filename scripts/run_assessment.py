@@ -344,6 +344,49 @@ def dimension_indexes(headers: list[Any], dimensions: list[str], config: dict[st
     return indexes
 
 
+def document_dimensions(document: dict[str, Any], dimensions: list[str]) -> list[str]:
+    raw = document.get("dimensions")
+    if raw is None:
+        bindings = document.get("dimension_bindings")
+        requested = list(bindings) if isinstance(bindings, dict) and bindings else list(dimensions)
+    elif isinstance(raw, list):
+        requested = [str(value).strip() for value in raw]
+    else:
+        requested = [str(raw).strip()]
+    if not requested or any(not value for value in requested):
+        raise AssessmentError("证据 dimensions 必须包含至少一个有效维度")
+    if len(requested) != len(set(requested)):
+        raise AssessmentError("证据 dimensions 不能重复")
+    unknown = [dimension for dimension in requested if dimension not in dimensions]
+    if unknown:
+        raise AssessmentError("证据包含当前考试不存在的维度：" + "、".join(unknown))
+    return [dimension for dimension in dimensions if dimension in requested]
+
+
+def dimension_column_bindings(
+    document: dict[str, Any],
+    dimensions: list[str],
+    config: dict[str, Any],
+) -> dict[str, tuple[int, int]]:
+    headers = document["headers"]
+    scoped = document_dimensions(document, dimensions)
+    explicit = document.get("dimension_bindings")
+    if isinstance(explicit, dict) and explicit:
+        missing = [dimension for dimension in scoped if dimension not in explicit]
+        if missing:
+            raise AssessmentError("证据 dimension_bindings 缺少维度：" + "、".join(missing))
+        return {
+            dimension: (
+                int(explicit[dimension]["id_index"]),
+                int(explicit[dimension]["value_index"]),
+            )
+            for dimension in scoped
+        }
+    id_index = int(resolve_header(headers, config["id_headers"], "ID", True))
+    values = dimension_indexes(headers, scoped, config)
+    return {dimension: (id_index, value_index) for dimension, value_index in values.items()}
+
+
 def evidence_index(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for doc in documents:
@@ -359,6 +402,8 @@ def evidence_index(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "revision": metadata.get("revision", ""),
                 "sheet": doc.get("sheet", ""),
                 "range": doc.get("range", ""),
+                "dimensions": list(doc.get("dimensions") or []),
+                "dimension_bindings": dict(doc.get("dimension_bindings") or {}),
                 "read_at": doc.get("read_at", ""),
                 "content_sha256": digest,
             }
@@ -534,22 +579,22 @@ def ocr_review_items_before_scoring(
         if doc.get("source") != "image_ocr":
             continue
         headers = doc["headers"]
-        id_index = int(resolve_header(headers, config["id_headers"], "ID", True))
         name_index = resolve_header(headers, config["student_name_headers"], "同学名称", False)
+        bindings = dimension_column_bindings(doc, dimensions, config)
         document_name = normalize_name(doc.get("student_name"), aliases)
         for row in doc["rows"]:
-            row_id = normalize_id(row[id_index])
-            if not row_id:
-                continue
             student = normalize_name(row[name_index], aliases) if name_index is not None else document_name
-            confidence, confidence_issue = confidence_for_row(doc, row_id)
-            if confidence_issue:
-                reason = "学员答案OCR置信度无效：" + confidence_issue
-            elif confidence is not None and float(confidence) < threshold:
-                reason = f"OCR置信度 {float(confidence):.3f} 低于阈值 {threshold:.3f}"
-            else:
-                continue
-            for dimension in dimensions:
+            for dimension, (id_index, _) in bindings.items():
+                row_id = normalize_id(row[id_index])
+                if not row_id:
+                    continue
+                confidence, confidence_issue = confidence_for_row(doc, row_id)
+                if confidence_issue:
+                    reason = "学员答案OCR置信度无效：" + confidence_issue
+                elif confidence is not None and float(confidence) < threshold:
+                    reason = f"OCR置信度 {float(confidence):.3f} 低于阈值 {threshold:.3f}"
+                else:
+                    continue
                 if row_id in standard[dimension]:
                     add(role="homework", student=student, dimension=dimension, row_id=row_id, reason=reason)
     return review_items
@@ -557,25 +602,20 @@ def ocr_review_items_before_scoring(
 
 def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], config: dict[str, Any]) -> dict[str, OrderedDict[str, dict[str, Any]]]:
     standard: dict[str, OrderedDict[str, dict[str, Any]]] = {dim: OrderedDict() for dim in dimensions}
-    seen_ids: set[str] = set()
 
     for doc in documents:
-        headers = doc["headers"]
-        id_index = int(resolve_header(headers, config["id_headers"], "ID", True))
-        dim_indexes = dimension_indexes(headers, dimensions, config)
+        bindings = dimension_column_bindings(doc, dimensions, config)
         for row_number, row in enumerate(doc["rows"], start=2):
-            row_id = normalize_id(row[id_index])
-            has_dimension_value = any(compact_text(row[index]) for index in dim_indexes.values())
-            if not row_id:
-                if has_dimension_value:
-                    raise AssessmentError(f"标准答案第 {row_number} 行有答案但 ID 为空")
-                continue
-            if row_id in seen_ids:
-                raise AssessmentError(f"标准答案出现重复 ID：{row_id}")
-            seen_ids.add(row_id)
-            confidence, confidence_issue = confidence_for_row(doc, row_id)
-            for dimension, index in dim_indexes.items():
-                raw = row[index]
+            for dimension, (id_index, value_index) in bindings.items():
+                row_id = normalize_id(row[id_index])
+                raw = row[value_index]
+                if not row_id:
+                    if compact_text(raw):
+                        raise AssessmentError(f"标准答案“{dimension}”第 {row_number} 行有答案但 ID 为空")
+                    continue
+                if row_id in standard[dimension]:
+                    raise AssessmentError(f"标准答案“{dimension}”出现重复 ID：{row_id}")
+                confidence, confidence_issue = confidence_for_row(doc, row_id)
                 keywords = standard_answer_keywords(raw)
                 standard[dimension][row_id] = {
                     "raw": display_cell_value(raw),
@@ -586,8 +626,9 @@ def parse_standard(documents: list[dict[str, Any]], dimensions: list[str], confi
                     "confidence": confidence,
                     "confidence_issue": confidence_issue,
                 }
-    if not seen_ids:
-        raise AssessmentError("标准答案没有有效 ID")
+    missing_dimensions = [dimension for dimension in dimensions if not standard[dimension]]
+    if missing_dimensions:
+        raise AssessmentError("标准答案以下维度没有有效 ID：" + "、".join(missing_dimensions))
     return standard
 
 
@@ -611,39 +652,44 @@ def parse_homework_documents(
 
     for doc in documents:
         headers = doc["headers"]
-        id_index = int(resolve_header(headers, config["id_headers"], "ID", True))
         name_index = resolve_header(headers, config["student_name_headers"], "同学名称", False)
-        dim_indexes = dimension_indexes(headers, dimensions, config)
+        bindings = dimension_column_bindings(doc, dimensions, config)
         document_name = normalize_name(doc.get("student_name"), aliases)
         if name_index is None and not document_name:
             raise AssessmentError("作业证据必须包含同学名称列，或在顶层提供 student_name")
 
         for row_number, row in enumerate(doc["rows"], start=2):
-            row_id = normalize_id(row[id_index])
-            if not row_id:
-                if any(compact_text(row[index]) for index in dim_indexes.values()):
-                    anomalies.append({"student": document_name, "type": "作业ID为空", "dimension": "", "id": "", "detail": f"第{row_number}行有答案但ID为空"})
-                continue
             row_name = normalize_name(row[name_index], aliases) if name_index is not None else document_name
             if document_name and row_name and row_name != document_name:
                 raise AssessmentError(f"作业证据 student_name={document_name} 与第{row_number}行姓名={row_name} 冲突")
             name = row_name or document_name
-            if not name:
-                raise AssessmentError(f"作业第 {row_number} 行 ID {row_id} 没有同学名称")
-            if name not in students:
-                order_counter += 1
-                students[name] = StudentRecord(
-                    name=name,
-                    source_kind=str(doc.get("source", "docs")),
-                    answers={dim: OrderedDict() for dim in dimensions},
-                    source_order=order_counter,
-                )
-            student = students[name]
-            confidence, confidence_issue = confidence_for_row(doc, row_id)
-            for dimension, index in dim_indexes.items():
+            for dimension, (id_index, value_index) in bindings.items():
+                row_id = normalize_id(row[id_index])
+                raw = row[value_index]
+                if not row_id:
+                    if compact_text(raw):
+                        anomalies.append({
+                            "student": name,
+                            "type": "作业ID为空",
+                            "dimension": dimension,
+                            "id": "",
+                            "detail": f"第{row_number}行有答案但ID为空",
+                        })
+                    continue
+                if not name:
+                    raise AssessmentError(f"作业第 {row_number} 行“{dimension}”ID {row_id} 没有同学名称")
+                if name not in students:
+                    order_counter += 1
+                    students[name] = StudentRecord(
+                        name=name,
+                        source_kind=str(doc.get("source", "docs")),
+                        answers={dim: OrderedDict() for dim in dimensions},
+                        source_order=order_counter,
+                    )
+                student = students[name]
                 if row_id in student.answers[dimension]:
                     raise AssessmentError(f"学员 {name} 的“{dimension}”出现重复 ID：{row_id}")
-                raw = row[index]
+                confidence, confidence_issue = confidence_for_row(doc, row_id)
                 student.answers[dimension][row_id] = {
                     "raw": "" if raw is None else str(raw),
                     "confidence": confidence,
@@ -2077,6 +2123,7 @@ def manifest_failures(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                     "item_id": item_id,
                     "role": entry.get("role", ""),
                     "student": entry.get("student", ""),
+                    "dimensions": list(entry.get("dimensions") or []),
                     "error": entry.get("error") or "等待读取",
                     "attempts": entry.get("attempts", 0),
                 }

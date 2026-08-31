@@ -746,6 +746,128 @@ class PipelineTests(unittest.TestCase):
                 self.config,
             )
 
+    def test_dual_dimension_standard_with_duplicate_id_headers_and_split_homework(self):
+        dimensions = ["画面美学", "动态美学"]
+        bindings = {
+            "画面美学": {"id_index": 0, "value_index": 1},
+            "动态美学": {"id_index": 2, "value_index": 3},
+        }
+        standard_doc = document(
+            ["ID", "画面美学", "ID", "动态美学"],
+            [[1, "都一般", 10, "一样好"], [2, "videoExp", 11, "videoContrast"]],
+            document_id="dual-standard",
+        )
+        standard_doc["dimension_bindings"] = bindings
+        runtime.validate_evidence_payload(standard_doc)
+        with self.assertRaisesRegex(runtime.ManifestError, "重复ID列"):
+            invalid = dict(standard_doc)
+            invalid.pop("dimension_bindings")
+            runtime.validate_evidence_payload(invalid)
+
+        for group in ("29组", "30组", "31组"):
+            image_doc = document(
+                ["同学名称", "ID", "画面美学"],
+                [["张三", 2, "videoExp好"], ["张三", 1, "都一般"]],
+                document_id=f"{group}-image",
+            )
+            image_doc["dimensions"] = ["画面美学"]
+            dynamic_doc = document(
+                ["同学名称", "ID", "动态美学"],
+                [["张三", 11, "videoContrast好"], ["张三", 10, "一样好"]],
+                document_id=f"{group}-dynamic",
+            )
+            dynamic_doc["dimensions"] = ["动态美学"]
+            result = pipeline.build_scored_result(
+                profile_key="online-aesthetics-dual",
+                group=group,
+                progress="双维度分源回归",
+                standard_documents=[standard_doc],
+                homework_documents=[image_doc, dynamic_doc],
+                aliases={},
+                source_mode="docs",
+            )
+            self.assertEqual(result["run_status"], "complete")
+            summary = result["summary"][0]
+            self.assertEqual((summary["overall_correct"], summary["overall_total"]), (4, 4))
+            self.assertEqual(summary["dimensions"]["画面美学"]["accuracy"], 1.0)
+            self.assertEqual(summary["dimensions"]["动态美学"]["accuracy"], 1.0)
+            self.assertEqual(result["evidence"][0]["dimension_bindings"], bindings)
+            self.assertEqual(result["evidence"][1]["dimensions"], ["画面美学"])
+
+    def test_manifest_dimension_sources_have_distinct_items_and_layout_scopes(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            payload = manifest_payload(homework=[
+                {
+                    "student": "张三", "id": "zhang-image",
+                    "url": "https://docs.corp.kuaishou.com/zhang-image",
+                    "revision": "image-r1",
+                    "dimension": "画面美学",
+                },
+                {
+                    "student": "张三", "id": "zhang-dynamic",
+                    "url": "https://docs.corp.kuaishou.com/zhang-dynamic",
+                    "revision": "dynamic-r1",
+                    "dimensions": ["动态美学"],
+                },
+            ])
+            payload["exam_profile"] = "online-aesthetics-dual"
+            payload["progress"] = "双维度分源"
+            payload["standard"]["dimension_bindings"] = {
+                "画面美学": {"id_index": 0, "value_index": 1},
+                "动态美学": {"id_index": 2, "value_index": 3},
+            }
+            payload["homework"]["layout_reuse"] = {"enabled": True, "discovery_range": "A1:Z100"}
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            state = runtime.load_state(manifest)
+            standard_spec = runtime.document_specs(manifest, state, stage="initial")[0]
+            self.assertEqual(set(standard_spec["dimension_bindings"]), {"画面美学", "动态美学"})
+            specs = runtime.document_specs(manifest, state, stage="students")
+            self.assertEqual(len({item["item_id"] for item in specs}), 2)
+            prepared = runtime.prepare_homework_layout_specs(manifest, state, specs)
+            self.assertEqual(
+                {item["layout_scope"] for item in prepared},
+                {"dimensions:画面美学", "dimensions:动态美学"},
+            )
+            self.assertTrue(all(item["read_mode"] == "discovery_probe" for item in prepared))
+            public = [runtime.public_workflow_spec(item) for item in prepared]
+            self.assertEqual({tuple(item["dimensions"]) for item in public}, {("画面美学",), ("动态美学",)})
+
+            plan = runtime.plan_reads(manifest, specs)
+            self.assertEqual(len(plan["read"]), 2)
+            for read_spec in plan["read"]:
+                dimension = read_spec["dimensions"][0]
+                evidence_path = temp / f"{read_spec['item_id']}.json"
+                evidence_payload = document(
+                    ["同学名称", "ID", dimension],
+                    [["张三", 1, "都一般"]],
+                    student_name="张三",
+                    document_id=read_spec["document_id"],
+                    revision=read_spec["revision"],
+                )
+                evidence_payload["dimensions"] = [dimension]
+                write_json(evidence_path, evidence_payload)
+                learned = runtime.ingest_evidence(manifest, read_spec["item_id"], evidence_path)
+                self.assertEqual(learned["learned_layout"]["dimensions"], [dimension])
+            learned_scopes = runtime.load_state(manifest)["layouts"]["homework_by_dimension"]
+            self.assertEqual(
+                set(learned_scopes),
+                {"dimensions:画面美学", "dimensions:动态美学"},
+            )
+
+            planned = dict(prepared[0])
+            evidence = document(
+                ["同学名称", "ID", planned["dimensions"][0]],
+                [["张三", 1, "都一般"]],
+                student_name="张三",
+                document_id=planned["document_id"],
+                revision=planned.get("revision") or "r1",
+            )
+            with self.assertRaisesRegex(runtime.ManifestError, "维度计划"):
+                runtime.validate_evidence_metadata(planned, evidence)
+
     def test_evidence_schema_version_is_required(self):
         with tempfile.TemporaryDirectory() as temp_name:
             path = Path(temp_name) / "bad.json"

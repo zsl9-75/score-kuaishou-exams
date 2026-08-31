@@ -23,6 +23,31 @@
 
 标准答案可没有“同学名称”列。作业证据必须包含姓名列；如果一份文档只属于一名学员，也可在顶层提供 `student_name`，但不能同时与姓名列产生冲突。
 
+## 双维度分源与重复 ID 表头
+
+如果标准表为每个维度各放一套 `ID + 答案`，必须保留原表，不得拼接、补列或伪造中间表。用从0开始的列下标显式绑定每个维度：
+
+```json
+{
+  "headers": ["ID", "画面美学", "ID", "动态美学"],
+  "rows": [[1, "都一般", 10, "一样好"]],
+  "dimension_bindings": {
+    "画面美学": {"id_index": 0, "value_index": 1},
+    "动态美学": {"id_index": 2, "value_index": 3}
+  }
+}
+```
+
+只有这种完整、无列复用的绑定允许重复 `ID` 表头；其他重复表头仍明确停止。每个维度使用自己的 ID 集合评分，禁止用一个维度的 ID 列关联另一个维度。
+
+如果同一学员的两个维度来自两份文档，每份证据必须带自己的维度身份：
+
+```json
+{"student_name": "张三", "dimensions": ["画面美学"], "headers": ["ID", "画面美学"], "rows": []}
+```
+
+另一份写 `"dimensions": ["动态美学"]`。评分器仅在“规范化姓名 + 明确维度”一致时合并，两份原始证据的 URL、revision、页签、范围和哈希分别保留。没有 `dimensions` 的旧证据继续按“该文档包含考试全部维度”处理。
+
 截图证据的 `document.id` 是图片文件名，`document.revision` 是图片SHA-256；`sheet` 是图片名，`range` 记录识别出的ID与目标维度。标准答案截图不含 `student_name`，作业截图必须在文件名判断或图内姓名OCR后写入 `student_name`。`ocr` 字段记录引擎、并发数和实测耗时；`confidence` 按规范化ID记录0–1置信度。
 
 标准答案单元格可保存一个或多个可接受答案。必须保留 Docs 返回的原始结构，不要在读取证据时预先拼接或覆盖：
@@ -62,7 +87,7 @@
 - 保留空单元格为 `null` 或空字符串，不删除含特殊允许空值的题目。补齐的 `null` 继续进入既有空值评分或标准答案审核规则。
 - 保留标准答案单元格的原始字符串、数组或标签对象；解析后的关键词集合由评分脚本生成，不得替换原始单元格。
 - 保留 ID 原值，不在读取阶段排序或补齐。
-- `document.url`、`id`、`revision`、`sheet`、`range` 用于审计和缓存；没有 revision 时保留空字符串。
+- `document.url`、`id`、`revision`、`sheet`、`range`、`dimensions` 和 `dimension_bindings` 用于审计和缓存；没有 revision 时保留空字符串。
 - 不读取与目标表格无关的工作表和范围。
 
 评分脚本的 schema v4 结果 JSON 会在 `standard_answer_evidence` 中逐个记录 `dimension`、规范化 `id`、`raw_cell`、`keywords`、`standard_blank`、标准答案OCR置信度和原始行号；并包含：
@@ -108,7 +133,7 @@ Docs 取数不再由 Agent 手工组合中间状态。`manifest_runtime.py workf
 
 ## 缓存键与续跑状态
 
-- revision 存在时，证据缓存键是 `role + student + document_id + revision + sheet + range` 的稳定哈希，禁止不同学员共享同一证据缓存项。
+- revision 存在时，证据缓存键是 `role + student + document_id + revision + sheet + range + dimensions + dimension_bindings` 的稳定哈希，禁止不同学员或不同维度共享同一证据缓存项。
 - revision 为空时，不使用 revision 缓存盲目跳过读取；读取后以完整证据内容哈希保存。
 - 学员评分缓存键包含标准答案内容哈希、该学员作业内容哈希、考试配置哈希、评分规则版本、姓名别名哈希、标准空值处理策略和decision key。
 - 任务状态以文档为单位记录 `pending/cached/success/failed/removed`、尝试次数、错误和缓存路径。每份证据成功后立即原子保存证据与状态。
