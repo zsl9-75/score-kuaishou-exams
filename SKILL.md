@@ -7,7 +7,13 @@ description: 核对快手考试、补考和小考准确率，按固定维度与I
 
 使用 Manifest 编排 Docs 读取，使用脚本执行缓存、匹配、评分和输出。不要临时重写评分规则。
 
-优先使用 `scripts/run_assessment.py` 与 `scripts/manifest_runtime.py`。若目标平台把Skill平铺且没有 `scripts/`，使用Skill根目录下同名脚本；脚本会自动从根目录寻找配置和OCR资源。不要自行猜测其他路径。
+不要假设当前工作目录或让用户提供安装路径。先取宿主为本次已加载 `SKILL.md` 提供的绝对路径，以它的父目录作为Skill根目录，并运行同目录的 [resolve_skill.py](resolve_skill.py)。解析器会自动识别保留 `scripts/` 的标准布局、平台平铺布局或混合布局，并返回正式入口的绝对路径：
+
+```bash
+python3 /宿主提供的Skill根目录/resolve_skill.py
+```
+
+后续只使用返回的 `entrypoints.manifest_runtime`、`entrypoints.run_assessment` 和 `entrypoints.compose_score_images`，本次运行不再搜索路径。禁止从当前目录猜测、全盘搜索、询问用户安装位置或为适配目录复制/改写评分脚本。下文的 `scripts/*.py` 仅表示逻辑入口，实际执行时替换为解析器返回的绝对路径。
 
 ## 入口分流
 

@@ -10,7 +10,7 @@
 请使用 $skill-installer 从 https://github.com/zsl9-75/score-kuaishou-exams 安装仓库根目录的 Skill：path 使用 .，安装名使用 score-kuaishou-exams。
 ```
 
-标准安装应保留 `scripts/`、`references/` 和 `agents/`。若目标平台仍会自动平铺，当前脚本也能从Skill根目录寻找同名配置和OCR资源。Excel与PNG依赖可用下列方式安装：
+标准安装应保留 `scripts/`、`references/` 和 `agents/`。若目标平台自动平铺，根目录的 `resolve_skill.py` 会从自身位置识别实际安装根目录并返回正式脚本绝对路径，不需要用户知道安装位置。Excel与PNG依赖可用下列方式安装：
 
 ```bash
 python3 -m pip install -r requirements.txt

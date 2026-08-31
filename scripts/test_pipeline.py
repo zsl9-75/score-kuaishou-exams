@@ -34,6 +34,8 @@ composer = importlib.util.module_from_spec(COMPOSE_SPEC)
 sys.modules[COMPOSE_SPEC.name] = composer
 COMPOSE_SPEC.loader.exec_module(composer)
 
+RESOLVER_PATH = MODULE_PATH.parent.parent / "resolve_skill.py"
+
 
 def document(headers, rows, *, student_name="", source="docs", document_id="test", revision="r1"):
     payload = {
@@ -116,6 +118,54 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(profiles["final-image-to-video"]["dimensions"]), 11)
         self.assertEqual(profiles["retake-text-to-video"]["dimensions"], profiles["final-text-to-video"]["dimensions"])
         self.assertEqual(profiles["retake-image-to-video"]["dimensions"], profiles["final-image-to-video"]["dimensions"])
+
+    def test_skill_entrypoint_resolver_supports_standard_and_flat_layouts(self):
+        standard = subprocess.run(
+            [sys.executable, str(RESOLVER_PATH)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(standard.returncode, 0, standard.stderr)
+        standard_payload = json.loads(standard.stdout)
+        self.assertEqual(standard_payload["status"], "ready")
+        self.assertEqual(standard_payload["layout"], "standard")
+        self.assertTrue(all(Path(path).is_absolute() and Path(path).is_file() for path in standard_payload["entrypoints"].values()))
+        capabilities = subprocess.run(
+            [sys.executable, standard_payload["entrypoints"]["manifest_runtime"], "capabilities", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(capabilities.returncode, 0, capabilities.stderr)
+        self.assertIn("workflow", json.loads(capabilities.stdout)["commands"])
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            flat = Path(temp_name)
+            shutil.copy2(RESOLVER_PATH, flat / "resolve_skill.py")
+            shutil.copy2(RESOLVER_PATH.parent / "SKILL.md", flat / "SKILL.md")
+            for name in ("manifest_runtime.py", "run_assessment.py", "compose_score_images.py", "build_workbook.py", "ocr_api.py", "ocr_vision.swift"):
+                shutil.copy2(MODULE_PATH.parent / name, flat / name)
+            for name in ("exam_profiles.json", "evidence-schema.md", "image-composition.md", "manifest.md"):
+                shutil.copy2(RESOLVER_PATH.parent / "references" / name, flat / name)
+            resolved = subprocess.run(
+                [sys.executable, str(flat / "resolve_skill.py")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stderr)
+            flat_payload = json.loads(resolved.stdout)
+            self.assertEqual(flat_payload["layout"], "flat")
+            self.assertEqual(Path(flat_payload["skill_root"]), flat.resolve())
+            flat_capabilities = subprocess.run(
+                [sys.executable, flat_payload["entrypoints"]["manifest_runtime"], "capabilities", "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(flat_capabilities.returncode, 0, flat_capabilities.stderr)
+            self.assertIn("workflow", json.loads(flat_capabilities.stdout)["commands"])
 
     def test_score_image_composition_uses_dynamic_union_and_assessment_sections(self):
         with tempfile.TemporaryDirectory() as temp_name:
