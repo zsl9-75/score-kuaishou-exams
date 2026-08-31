@@ -43,6 +43,7 @@ Manifest 内的证据、别名和缓存相对路径都相对于 Manifest 所在�
   },
   "runtime": {
     "max_concurrency": 15,
+    "checkpoint_batch_size": 3,
     "retries": 3,
     "retry_delays_seconds": [1, 2],
     "ocr_workers": 4,
@@ -117,6 +118,11 @@ python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json
 ```
 
 `workflow` 每次返回 `workflow_status`、`operation_id`、`action`、`recoverable`、`blocked_items` 和 `user_actions`：
+
+- `preflight_docs` 仍可批量检查全部待读文档，因为它只返回权限、revision和范围等紧凑元数据。
+- `read_docs` 按 `runtime.checkpoint_batch_size` 切成耐中断小批次；默认每批3份，布局探测或布局回退固定为1份。
+- 当前小批次每份证据落盘后立即提交。允许只提交批次中已经完成的部分，未回传项会保留并出现在下一次 `read_docs`，不会被判定为失败。
+- `action.effective_concurrency` 只控制当前小批次并发，不能超过批次数或 `runtime.max_concurrency`。
 
 - `action_required + preflight_docs`：填充 `action.response_template` 后使用 `--response`回传。
 - `action_required + read_docs`：将证据保存为 `<item_id>.json`，使用 `--evidence-dir` 回传；读取失败可同时放在 `--response`。
@@ -204,6 +210,7 @@ python3 scripts/manifest_runtime.py ingest-batch \
 字段规则：
 
 - `runtime.max_concurrency` 默认 15，只允许 1–15。
+- `runtime.checkpoint_batch_size` 默认 3，只允许 1–5。它决定每次 `read_docs` 最多读取并落盘多少份证据，与并发上限分开；批次越小，中断时可能重读的文档越少。
 - `runtime.retries` 默认 3，表示最多3次总尝试（首次＋最多2次重试）；对应退避数组默认为 1、2 秒。
 - `runtime.learn_homework_layout` 默认 `true`；可由 `homework.layout_reuse.enabled` 覆盖。
 - `output.png` 是 `on|off`，默认 `off`。

@@ -67,7 +67,7 @@ python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json
 python3 scripts/manifest_runtime.py workflow --manifest /path/to/task.json --response /path/to/preflight.json
 ```
 
-- `read_docs`：按 `action.items` 并发读取，每份证据命名为 `<item_id>.json`。成功证据写入同一临时目录，失败项写入响应JSON，一次提交：
+- `read_docs`：只读取当前 `action.items`，不要提前读取后续学员。程序默认每批最多3份；布局探测或回退批次固定为1份。每份证据命名为 `<item_id>.json`，当前批次完成后立即提交，不等待全组读完：
 
 ```bash
 python3 scripts/manifest_runtime.py workflow \
@@ -75,6 +75,8 @@ python3 scripts/manifest_runtime.py workflow \
   --evidence-dir /path/to/incoming \
   --response /path/to/read-failures.json
 ```
+
+`action.effective_concurrency` 是当前小批次实际允许的并发数，`runtime.max_concurrency` 只是并发上限，不代表一次检查点必须容纳同样多的文档。如果会话即将切换或压缩，可只提交当前批次中已经落盘的证据；未回传项会自动进入下一批，禁止让已完成的原始读取只停留在对话上下文中。
 
 - `retrying`：等到 `next_attempt_at` 后重新执行 `workflow`，不询问用户。
 - `ready_to_score`：执行评分后，用返回的 `operation_id` 和评分JSON回传终态：
@@ -90,7 +92,7 @@ python3 scripts/manifest_runtime.py workflow \
 - `awaiting_user`或 `complete`：才能结束自动循环。`awaiting_user` 必须一次性转述全部 `user_actions`。
 - `engineering_blocked`：仅在相同内部契约错误连续3次后进入，必须保留检查点并报告具体接口、原因和恢复方法。
 
-5. 只要 `recoverable=true`、仍有 `action`或状态为 `retrying`，Agent就必须继续，禁止把工程性错误交给用户处理。未知命令时立即执行 `capabilities --json`并回到 `workflow`。
+5. 只要 `recoverable=true`、仍有 `action`或状态为 `retrying`，Agent就必须继续，禁止把工程性错误交给用户处理。未知命令时立即执行 `capabilities --json`并回到 `workflow`。会话中断后直接复用原Manifest和 `task_id` 调用 `workflow`；不要新建任务，也不要为普通中断使用 `--refresh`。
 
 6. 权限、不存在或身份冲突只隔离对应文档；所有其他可处理文档继续。最终只保存 `incomplete` JSON检查点，禁止生成正式Excel/PNG。
 

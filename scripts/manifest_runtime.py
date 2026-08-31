@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 
 MAX_CONCURRENCY = 15
+DEFAULT_CHECKPOINT_BATCH_SIZE = 3
+MAX_CHECKPOINT_BATCH_SIZE = 5
 DEFAULT_RETRIES = 3
 RETRYABLE_ERROR_KINDS = {"429", "timeout", "transient_5xx"}
 FATAL_ERROR_KINDS = {"permission", "not_found", "invalid_evidence", "metadata_mismatch", "other"}
@@ -108,6 +110,12 @@ def capabilities_payload() -> dict[str, Any]:
             "contract_errors": "recoverable and do not consume Docs retries",
             "external_retries": DEFAULT_RETRIES,
             "formal_outputs_require_complete_evidence": True,
+        },
+        "read_batching": {
+            "default_checkpoint_batch_size": DEFAULT_CHECKPOINT_BATCH_SIZE,
+            "max_checkpoint_batch_size": MAX_CHECKPOINT_BATCH_SIZE,
+            "layout_discovery_batch_size": 1,
+            "partial_submission_allowed": True,
         },
     }
 
@@ -228,10 +236,20 @@ def load_manifest(path: Path) -> dict[str, Any]:
     concurrency = int(runtime.get("max_concurrency", MAX_CONCURRENCY))
     if concurrency < 1 or concurrency > MAX_CONCURRENCY:
         raise ManifestError(f"max_concurrency 必须在 1–{MAX_CONCURRENCY} 之间")
+    raw_batch_size = runtime.get("checkpoint_batch_size", DEFAULT_CHECKPOINT_BATCH_SIZE)
+    if isinstance(raw_batch_size, bool):
+        raise ManifestError(f"checkpoint_batch_size 必须在 1–{MAX_CHECKPOINT_BATCH_SIZE} 之间")
+    try:
+        checkpoint_batch_size = int(raw_batch_size)
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(f"checkpoint_batch_size 必须在 1–{MAX_CHECKPOINT_BATCH_SIZE} 之间") from exc
+    if checkpoint_batch_size < 1 or checkpoint_batch_size > MAX_CHECKPOINT_BATCH_SIZE:
+        raise ManifestError(f"checkpoint_batch_size 必须在 1–{MAX_CHECKPOINT_BATCH_SIZE} 之间")
     retries = int(runtime.get("retries", DEFAULT_RETRIES))
     if retries < 1:
         raise ManifestError("retries 必须至少为1")
     runtime["max_concurrency"] = concurrency
+    runtime["checkpoint_batch_size"] = checkpoint_batch_size
     runtime["retries"] = retries
     runtime.setdefault("retry_delays_seconds", [1, 2])
     delays = runtime["retry_delays_seconds"]
@@ -443,7 +461,11 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
             "resolved_students": [],
             "layouts": {},
             "scheduler": {
-                "effective_concurrency": manifest["runtime"]["max_concurrency"],
+                "effective_concurrency": min(
+                    manifest["runtime"]["max_concurrency"],
+                    manifest["runtime"]["checkpoint_batch_size"],
+                ),
+                "checkpoint_batch_size": manifest["runtime"]["checkpoint_batch_size"],
                 "success_batch_streak": 0,
                 "max_observed_batch": 0,
                 "batches": {},
@@ -476,8 +498,11 @@ def load_state(manifest: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("layouts", {})
     state.setdefault("schema_version", 2)
     scheduler = state.setdefault("scheduler", {})
-    scheduler.setdefault("effective_concurrency", manifest["runtime"]["max_concurrency"])
-    scheduler["effective_concurrency"] = min(int(scheduler["effective_concurrency"]), manifest["runtime"]["max_concurrency"], MAX_CONCURRENCY)
+    scheduler["checkpoint_batch_size"] = manifest["runtime"]["checkpoint_batch_size"]
+    scheduler["effective_concurrency"] = min(
+        manifest["runtime"]["max_concurrency"],
+        manifest["runtime"]["checkpoint_batch_size"],
+    )
     scheduler.setdefault("success_batch_streak", 0)
     scheduler.setdefault("max_observed_batch", 0)
     scheduler.setdefault("batches", {})
@@ -1168,7 +1193,12 @@ def ingest_evidence(manifest: dict[str, Any], item_id: str, evidence_path: Path)
         return _ingest_evidence_unlocked(manifest, item_id, evidence_path)
 
 
-def ingest_evidence_batch(manifest: dict[str, Any], evidence_dir: Path) -> dict[str, Any]:
+def ingest_evidence_batch(
+    manifest: dict[str, Any],
+    evidence_dir: Path,
+    *,
+    item_ids: set[str] | None = None,
+) -> dict[str, Any]:
     if not evidence_dir.is_dir():
         raise ManifestError(f"批量证据目录不存在：{evidence_dir}")
     state = load_state(manifest)
@@ -1176,6 +1206,7 @@ def ingest_evidence_batch(manifest: dict[str, Any], evidence_dir: Path) -> dict[
         item_id: evidence_dir / f"{item_id}.json"
         for item_id, entry in state.get("documents", {}).items()
         if entry.get("status") in {"pending", "in_progress", "needs_discovery"}
+        and (item_ids is None or item_id in item_ids)
     }
     results: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -1415,8 +1446,21 @@ def create_workflow_operation(
             ],
         }
     elif action_type == "read_docs":
+        scheduler = state.setdefault("scheduler", {})
+        batch_number = int(scheduler.get("next_batch_number", 1))
+        effective_concurrency = min(
+            int(scheduler.get("effective_concurrency", manifest["runtime"]["max_concurrency"])),
+            len(specs),
+        )
+        operation.update({
+            "batch_number": batch_number,
+            "checkpoint_batch_size": manifest["runtime"]["checkpoint_batch_size"],
+            "effective_concurrency": effective_concurrency,
+        })
         operation["evidence_contract"] = {
             "directory_file_name": "<item_id>.json",
+            "partial_submission_allowed": True,
+            "submit_after_current_batch": True,
             "failure_response": {
                 "schema_version": WORKFLOW_VERSION,
                 "task_id": manifest["task_id"],
@@ -1424,6 +1468,17 @@ def create_workflow_operation(
                 "operation_id": operation_id,
                 "items": [{"item_id": "ITEM_ID", "error_kind": "timeout", "error": "Docs timeout"}],
             },
+        }
+        scheduler["next_batch_number"] = batch_number + 1
+        scheduler["max_observed_batch"] = max(int(scheduler.get("max_observed_batch", 0)), len(specs))
+        scheduler.setdefault("batches", {})[str(batch_number)] = {
+            "operation_id": operation_id,
+            "stage": stage,
+            "item_ids": [str(spec["item_id"]) for spec in specs],
+            "item_count": len(specs),
+            "effective_concurrency": effective_concurrency,
+            "status": "in_progress",
+            "created_at": operation["created_at"],
         }
     elif action_type == "score":
         operation["score_args"] = {
@@ -1638,6 +1693,11 @@ def apply_read_operation(manifest: dict[str, Any], evidence_dir: Path, response_
     if operation_id in state["workflow"].get("applied_operations", {}):
         return {"duplicate": True, "warnings": ["重复的operation_id已忽略"], "recoveries": []}
     failures, envelope = parse_failure_response(response_path)
+    expected_ids = {
+        str(item.get("item_id") or "")
+        for item in operation.get("items", [])
+        if isinstance(item, dict)
+    }
     contract_errors: list[str] = []
     if envelope.get("task_id") and envelope["task_id"] != str(manifest["task_id"]):
         contract_errors.append("读取失败响应task_id与当前任务不一致")
@@ -1657,12 +1717,10 @@ def apply_read_operation(manifest: dict[str, Any], evidence_dir: Path, response_
             "warnings": [],
             "recoveries": [],
         }
-    batch = ingest_evidence_batch(manifest, evidence_dir)
-    expected_ids = {
-        str(item.get("item_id") or "")
-        for item in operation.get("items", [])
-        if isinstance(item, dict)
-    }
+    batch = ingest_evidence_batch(manifest, evidence_dir, item_ids=expected_ids)
+    reported_failure_ids = {failure["item_id"] for failure in failures if failure["item_id"] in expected_ids}
+    unreported_missing = [item_id for item_id in batch.get("missing_files", []) if item_id not in reported_failure_ids]
+    batch["missing_files"] = unreported_missing
     ignored_failures: list[str] = []
     with state_lock(manifest):
         state = load_state(manifest)
@@ -1685,8 +1743,23 @@ def apply_read_operation(manifest: dict[str, Any], evidence_dir: Path, response_
             ))
         state["workflow"].setdefault("applied_operations", {})[operation_id] = {"applied_at": utc_text(), "type": "read_docs"}
         state["workflow"]["current_operation"] = {}
+        scheduler = state.setdefault("scheduler", {})
+        batch_key = str(operation.get("batch_number") or "")
+        if batch_key:
+            batch_record = scheduler.setdefault("batches", {}).setdefault(batch_key, {})
+            batch_record.update({
+                "status": "partial" if unreported_missing else "complete",
+                "ingested": int(batch.get("ingested", 0)),
+                "failed": len(failure_results),
+                "missing": len(unreported_missing),
+                "finished_at": utc_text(),
+            })
+        if not unreported_missing and not failure_results:
+            scheduler["success_batch_streak"] = int(scheduler.get("success_batch_streak", 0)) + 1
+        else:
+            scheduler["success_batch_streak"] = 0
         save_state(manifest, state)
-    warnings = [f"{len(batch.get('missing_files', []))}份证据文件未回传"] if batch.get("missing_files") else []
+    warnings = [f"{len(unreported_missing)}份证据文件未回传，将在下一检查点批次继续"] if unreported_missing else []
     if ignored_failures:
         warnings.append("已忽略不属于当前操作的失败项：" + ",".join(sorted(ignored_failures)))
     return {
@@ -1694,6 +1767,19 @@ def apply_read_operation(manifest: dict[str, Any], evidence_dir: Path, response_
         "recoveries": [f"已入库{batch.get('ingested', 0)}份，布局回退{batch.get('needs_discovery', 0)}份，读取失败{len(failure_results)}份"],
         "batch": batch,
     }
+
+
+def checkpoint_read_specs(manifest: dict[str, Any], specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Limit one durable read operation to a small, restart-safe checkpoint batch."""
+    if not specs:
+        return []
+    discovery = next(
+        (spec for spec in specs if spec.get("read_mode") in {"discovery_probe", "discovery_fallback"}),
+        None,
+    )
+    if discovery is not None:
+        return [discovery]
+    return specs[: int(manifest["runtime"]["checkpoint_batch_size"])]
 
 
 def finalize_workflow_result(manifest: dict[str, Any], result_path: Path, operation_id: str) -> dict[str, Any]:
@@ -1808,7 +1894,8 @@ def workflow_next(manifest: dict[str, Any]) -> dict[str, Any]:
     plan = plan_reads(manifest, prepared)
     state = load_state(manifest)
     if plan["read"]:
-        operation = create_workflow_operation(manifest, state, action_type="read_docs", stage=stage, specs=plan["read"])
+        batch_specs = checkpoint_read_specs(manifest, plan["read"])
+        operation = create_workflow_operation(manifest, state, action_type="read_docs", stage=stage, specs=batch_specs)
         return workflow_response_payload(manifest, load_state(manifest), "action_required", operation=operation)
     if pending_preflight:
         operation = create_workflow_operation(manifest, state, action_type="preflight_docs", stage=stage, specs=pending_preflight)

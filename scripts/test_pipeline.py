@@ -55,10 +55,12 @@ def write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def manifest_payload(*, standard="standard.json", homework=None, max_concurrency=None):
+def manifest_payload(*, standard="standard.json", homework=None, max_concurrency=None, checkpoint_batch_size=None):
     runtime_config = {}
     if max_concurrency is not None:
         runtime_config["max_concurrency"] = max_concurrency
+    if checkpoint_batch_size is not None:
+        runtime_config["checkpoint_batch_size"] = checkpoint_batch_size
     return {
         "schema_version": 1,
         "task_id": "task-29-quiz",
@@ -1098,10 +1100,155 @@ class PipelineTests(unittest.TestCase):
             write_json(path, manifest_payload())
             loaded = runtime.load_manifest(path)
             self.assertEqual(loaded["runtime"]["max_concurrency"], 15)
+            self.assertEqual(loaded["runtime"]["checkpoint_batch_size"], 3)
             payload = manifest_payload(max_concurrency=16)
             write_json(path, payload)
             with self.assertRaisesRegex(runtime.ManifestError, "1–15"):
                 runtime.load_manifest(path)
+            for invalid in (0, 6, True, "many"):
+                with self.subTest(checkpoint_batch_size=invalid):
+                    write_json(path, manifest_payload(checkpoint_batch_size=invalid))
+                    with self.assertRaisesRegex(runtime.ManifestError, "checkpoint_batch_size 必须在 1–5"):
+                        runtime.load_manifest(path)
+
+    def test_workflow_checkpoints_small_batches_and_resumes_partial_submission(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            homework = [
+                {
+                    "student": f"学员{index}",
+                    "id": f"student-{index}",
+                    "url": f"https://docs.corp.kuaishou.com/student-{index}",
+                    "revision": f"student-{index}-r1",
+                }
+                for index in range(1, 8)
+            ]
+            payload = manifest_payload(homework=homework, max_concurrency=15, checkpoint_batch_size=3)
+            payload["runtime"]["learn_homework_layout"] = False
+            manifest_path = temp / "task.json"
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+
+            initial_plan = runtime.plan_reads(
+                manifest,
+                runtime.document_specs(manifest, runtime.load_state(manifest), stage="initial"),
+            )
+            standard_spec = initial_plan["read"][0]
+            standard_file = temp / "standard.json"
+            write_json(
+                standard_file,
+                document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard-doc", revision="std-r1"),
+            )
+            runtime.ingest_evidence(manifest, standard_spec["item_id"], standard_file)
+
+            preflight = runtime.workflow_command(manifest)
+            self.assertEqual(preflight["action"]["type"], "preflight_docs")
+            self.assertEqual(len(preflight["action"]["items"]), 7)
+            by_id = {
+                spec["item_id"]: spec
+                for spec in runtime.document_specs(manifest, runtime.load_state(manifest), stage="students")
+            }
+            response = preflight["action"]["response_template"]
+            for item in response["items"]:
+                item.update({
+                    "revision": by_id[item["item_id"]]["revision"],
+                    "sheet": "Sheet1",
+                    "range": "A1:Z100",
+                })
+            response_path = temp / "preflight.json"
+            write_json(response_path, response)
+            current = runtime.workflow_command(manifest, response=response_path)
+
+            self.assertEqual(current["action"]["type"], "read_docs")
+            self.assertEqual(len(current["action"]["items"]), 3)
+            self.assertEqual(current["action"]["checkpoint_batch_size"], 3)
+            self.assertEqual(current["action"]["effective_concurrency"], 3)
+            self.assertTrue(current["action"]["evidence_contract"]["partial_submission_allowed"])
+            batch_sizes = [len(current["action"]["items"])]
+
+            interrupted_batch = current["action"]
+            partial_dir = temp / "partial"
+            partial_dir.mkdir()
+            for item in interrupted_batch["items"][:2]:
+                write_json(
+                    partial_dir / f"{item['item_id']}.json",
+                    document(
+                        ["ID", "画面美学"], [[1, "都一般"]],
+                        student_name=item["student"], document_id=item["document_id"], revision=item["revision"],
+                    ),
+                )
+            current = runtime.workflow_command(manifest, evidence_dir=partial_dir)
+            self.assertTrue(any("1份证据文件未回传" in warning for warning in current["warnings"]))
+            self.assertEqual(len(current["action"]["items"]), 3)
+            self.assertEqual(current["action"]["items"][0]["item_id"], interrupted_batch["items"][2]["item_id"])
+            state = runtime.load_state(manifest)
+            self.assertEqual(state["scheduler"]["batches"]["1"]["status"], "partial")
+            self.assertEqual(state["scheduler"]["batches"]["1"]["ingested"], 2)
+            self.assertEqual(state["scheduler"]["batches"]["1"]["missing"], 1)
+
+            while current["action"]["type"] == "read_docs":
+                batch_sizes.append(len(current["action"]["items"]))
+                incoming = temp / f"batch-{current['action']['batch_number']}"
+                incoming.mkdir()
+                for item in current["action"]["items"]:
+                    write_json(
+                        incoming / f"{item['item_id']}.json",
+                        document(
+                            ["ID", "画面美学"], [[1, "都一般"]],
+                            student_name=item["student"], document_id=item["document_id"], revision=item["revision"],
+                        ),
+                    )
+                current = runtime.workflow_command(manifest, evidence_dir=incoming)
+
+            self.assertEqual(current["workflow_status"], "ready_to_score")
+            self.assertEqual(current["action"]["type"], "score")
+            self.assertEqual(batch_sizes, [3, 3, 2])
+            state = runtime.load_state(manifest)
+            self.assertEqual(state["scheduler"]["max_observed_batch"], 3)
+            self.assertEqual(state["scheduler"]["success_batch_streak"], 2)
+            self.assertEqual([state["scheduler"]["batches"][key]["status"] for key in ("1", "2", "3")], ["partial", "complete", "complete"])
+
+    def test_workflow_forces_layout_discovery_to_single_document_batch(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp = Path(temp_name)
+            homework = [
+                {
+                    "student": f"学员{index}",
+                    "id": f"student-{index}",
+                    "url": f"https://docs.corp.kuaishou.com/student-{index}",
+                    "revision": f"student-{index}-r1",
+                }
+                for index in range(1, 6)
+            ]
+            manifest_path = temp / "task.json"
+            payload = manifest_payload(homework=homework, checkpoint_batch_size=3)
+            payload["homework"]["layout_reuse"] = {"enabled": True, "discovery_range": "A1:Z100"}
+            write_json(manifest_path, payload)
+            manifest = runtime.load_manifest(manifest_path)
+            initial_plan = runtime.plan_reads(
+                manifest,
+                runtime.document_specs(manifest, runtime.load_state(manifest), stage="initial"),
+            )
+            standard_file = temp / "standard.json"
+            write_json(
+                standard_file,
+                document(["ID", "画面美学"], [[1, "都一般"]], document_id="standard-doc", revision="std-r1"),
+            )
+            runtime.ingest_evidence(manifest, initial_plan["read"][0]["item_id"], standard_file)
+            preflight = runtime.workflow_command(manifest)
+            response = preflight["action"]["response_template"]
+            specs = {
+                spec["item_id"]: spec
+                for spec in runtime.document_specs(manifest, runtime.load_state(manifest), stage="students")
+            }
+            for item in response["items"]:
+                item.update({"revision": specs[item["item_id"]]["revision"], "sheet": "作业", "range": "A1:Z100"})
+            response_path = temp / "preflight.json"
+            write_json(response_path, response)
+            read = runtime.workflow_command(manifest, response=response_path)
+            self.assertEqual(len(read["action"]["items"]), 1)
+            self.assertEqual(read["action"]["items"][0]["read_mode"], "discovery_probe")
+            self.assertEqual(read["action"]["effective_concurrency"], 1)
 
     def test_manifest_identity_blocks_task_id_reuse_across_group_exam_or_standard(self):
         changes = {
